@@ -1,0 +1,7 @@
+/build/
+README.local.md
+/.cache/
+/.vscode/
+/.idea/
+*.swp
+*~
