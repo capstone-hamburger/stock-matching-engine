@@ -37,6 +37,11 @@ Json order(std::int64_t id, std::string type = "SELL", int quantity = 2, int pri
     };
 }
 
+Json cancellation(std::int64_t orderId, std::int64_t userId)
+{
+    return {{"type", "CANCEL_ORDER"}, {"stockId", 1001}, {"orderId", orderId}, {"userId", userId}};
+}
+
 class Client final {
 public:
     explicit Client(std::uint16_t port)
@@ -164,6 +169,147 @@ void testMatchingAndValidation()
     replacement.start();
     expect(Client{replacement.port()}.request(order(1))["accepted"] == true,
         "stop must release the listener so a new router can bind");
+}
+
+void testCancellation()
+{
+    Router router{RouterConfig{.port = 0}};
+    router.start();
+    Client seller{router.port()};
+    Client buyer{router.port()};
+    const Json query{{"type", "GET_CURRENT_PRICE"}, {"stockId", 1001}};
+
+    const auto expectCancellation = [](const Json& result, std::int64_t orderId,
+                                       bool success, int quantity, const char* reason) {
+        expect(result == Json{
+            {"event", "CANCEL_RESULT"}, {"orderId", orderId}, {"stockId", 1001},
+            {"success", success}, {"canceledQuantity", quantity}, {"failureReason", reason}},
+            "cancellation response fields must match the engine outcome");
+    };
+
+    expect(seller.request(order(1, "SELL", 7))["accepted"] == true, "sell must rest before cancel");
+    expectCancellation(buyer.request(cancellation(1, 10)), 1, false, 0, "NOT_OWNER");
+    const auto filled = buyer.request(order(2, "BUY", 3, 10200));
+    expect(filled["filledQuantity"] == 3 && filled["trades"][0]["sellOrderId"] == 1,
+        "failed ownership check must leave the resting order intact");
+
+    // Ownership is checked against userId, not the transport connection.
+    expectCancellation(buyer.request(cancellation(1, 20)), 1, true, 4, "NONE");
+    expect(seller.request(query)["price"] == 10100, "cancel must retain last actual trade price");
+    expectCancellation(seller.request(cancellation(1, 20)), 1, false, 0, "ALREADY_CANCELED");
+    expectCancellation(buyer.request(cancellation(2, 10)), 2, false, 0, "ALREADY_FILLED");
+    expectCancellation(seller.request(cancellation(999, 20)), 999, false, 0, "ORDER_NOT_FOUND");
+    expectCancellation(seller.request(cancellation(0, 20)), 0, false, 0, "INVALID_ORDER_ID");
+    expectCancellation(seller.request(cancellation(-1, 20)), -1, false, 0, "INVALID_ORDER_ID");
+    expectCancellation(seller.request(cancellation(1, 0)), 1, false, 0, "INVALID_USER_ID");
+    expectCancellation(seller.request(cancellation(1, -1)), 1, false, 0, "INVALID_USER_ID");
+
+    const auto unmatchedBuy = buyer.request(order(3, "BUY", 1));
+    expect(unmatchedBuy["engineStatus"] == "OPEN" && unmatchedBuy["trades"].empty(),
+        "canceled ask remainder must not match a later buy");
+    expectCancellation(buyer.request(cancellation(3, 10)), 3, true, 1, "NONE");
+    expect(seller.request(order(4, "SELL", 1))["engineStatus"] == "OPEN",
+        "canceled bid must not match a later sell");
+    expectCancellation(seller.request(cancellation(4, 20)), 4, true, 1, "NONE");
+    expect(seller.request(order(1))["rejectionReason"] == "DUPLICATE_ORDER_ID",
+        "canceled order IDs must not be reusable");
+
+    // submit -> cancel -> counter-order on one connection must execute in that order.
+    buyer.send(order(10, "BUY", 2, 9000));
+    buyer.send(cancellation(10, 10));
+    buyer.send(order(11, "SELL", 2, 9000));
+    expect(buyer.receive()["engineStatus"] == "OPEN", "pipelined buy must rest");
+    expectCancellation(buyer.receive(), 10, true, 2, "NONE");
+    expect(buyer.receive()["engineStatus"] == "OPEN", "pipelined cancel must precede counter-order");
+    const auto nextTrade = buyer.request(order(12, "BUY", 1, 9000));
+    expect(nextTrade["trades"].size() == 1 && nextTrade["trades"][0]["tradeId"] == 2,
+        "cancellations must not generate trades or consume trade IDs");
+}
+
+void testCancellationValidation()
+{
+    Router router{RouterConfig{.port = 0}};
+    router.start();
+    Client client{router.port()};
+    expect(client.request(order(1))["accepted"] == true, "validation test order must rest");
+    const auto valid = cancellation(1, 20);
+    for (const auto* field : {"stockId", "orderId", "userId"}) {
+        for (const auto& value : {Json(1.5), Json("1"), Json(true), Json(nullptr),
+                 Json::array(), Json::object(), Json(std::numeric_limits<std::uint64_t>::max())}) {
+            auto invalid = valid;
+            invalid[field] = value;
+            expect(client.request(invalid)["code"] == "INVALID_REQUEST",
+                "cancel IDs must be int64 JSON integers");
+        }
+        auto missing = valid;
+        missing.erase(field);
+        expect(client.request(missing)["code"] == "INVALID_REQUEST", "cancel IDs are required");
+        missing["quantity"] = 1;
+        expect(client.request(missing)["code"] == "INVALID_REQUEST",
+            "same field count must not bypass required field validation");
+    }
+    for (const auto* field : {"quantity", "price", "status", "requestId"}) {
+        auto invalid = valid;
+        invalid[field] = 1;
+        expect(client.request(invalid)["code"] == "INVALID_REQUEST",
+            "cancel must reject extra fields, including partial-cancel quantities");
+    }
+    for (const int stockId : {0, -1}) {
+        auto invalid = valid;
+        invalid["stockId"] = stockId;
+        expect(client.request(invalid)["code"] == "INVALID_REQUEST", "stockId must be positive");
+    }
+    auto unknown = valid;
+    unknown["stockId"] = 9999;
+    expect(client.request(unknown)["code"] == "UNKNOWN_STOCK", "wrong stock cannot cancel an order");
+    auto unknownType = valid;
+    unknownType["type"] = "cancel_order";
+    expect(client.request(unknownType)["code"] == "INVALID_ORDER", "type matching is case sensitive");
+    expect(client.request(valid)["canceledQuantity"] == 2,
+        "invalid requests must preserve the order and connection for a later valid cancel");
+    expect(client.request(Json{{"type", "GET_CURRENT_PRICE"}, {"stockId", 1001}})["price"].is_null(),
+        "cancel before the first trade must keep the price null");
+
+    Router other{RouterConfig{.port = 0, .stockId = 2002}};
+    other.start();
+    Client otherClient{other.port()};
+    auto largeOrder = order(std::numeric_limits<std::int64_t>::max());
+    largeOrder["stockId"] = 2002;
+    largeOrder["userId"] = std::numeric_limits<std::int64_t>::max();
+    expect(otherClient.request(largeOrder)["accepted"] == true, "large IDs must be accepted");
+    auto largeCancel = cancellation(std::numeric_limits<std::int64_t>::max(),
+        std::numeric_limits<std::int64_t>::max());
+    largeCancel["stockId"] = 2002;
+    const auto result = otherClient.request(largeCancel);
+    expect(result["success"] == true && result["stockId"] == 2002
+        && result["orderId"] == std::numeric_limits<std::int64_t>::max(),
+        "cancel must honor configured stock and preserve int64 IDs");
+}
+
+void testCancellationCompetingWithFill()
+{
+    Router router{RouterConfig{.port = 0}};
+    router.start();
+    Client seller{router.port()};
+    expect(seller.request(order(1, "SELL", 1))["accepted"] == true, "race test ask must rest");
+    auto cancel = std::async(std::launch::async, [&router] {
+        Client client{router.port()};
+        return client.request(cancellation(1, 20));
+    });
+    auto buy = std::async(std::launch::async, [&router] {
+        Client client{router.port()};
+        return client.request(order(2, "BUY", 1));
+    });
+    const auto canceled = cancel.get();
+    const auto bought = buy.get();
+    if (canceled["success"] == true) {
+        expect(canceled["canceledQuantity"] == 1 && bought["engineStatus"] == "OPEN"
+            && bought["trades"].empty(), "cancel-first must leave the incoming buy unfilled");
+    } else {
+        expect(canceled["failureReason"] == "ALREADY_FILLED" && canceled["canceledQuantity"] == 0
+            && bought["engineStatus"] == "FILLED" && bought["trades"].size() == 1,
+            "fill-first must reject cancel without canceling already traded quantity");
+    }
 }
 
 void testCurrentPrice()
@@ -326,6 +472,9 @@ int main()
     try {
         testMatchingAndValidation();
         testCurrentPrice();
+        testCancellation();
+        testCancellationValidation();
+        testCancellationCompetingWithFill();
         testOrderingAndConcurrentConnections();
         testLifecycleAndLimits();
         std::cout << "WebSocket router integration tests passed.\n";

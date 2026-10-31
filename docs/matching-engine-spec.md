@@ -69,6 +69,9 @@ DB 초안의 이름과 정수 타입을 반영해 다음 용어를 사용한다.
 
 먼저 양수가 아닌 주문 ID와 사용자 ID를 각각 `InvalidOrderId`, `InvalidUserId`로 거절한다. 유효한 ID에 대해서는 주문 존재 여부, 요청자 소유 여부, 종료 상태 순서로 검사하므로 없는 주문은 `OrderNotFound`, 타인의 주문은 `NotOwner`, 전량 체결 주문은 `AlreadyFilled`, 이미 취소된 주문은 `AlreadyCanceled`를 반환하며 실패 시 상태는 바뀌지 않는다.
 
+WebSocket에서는 `type: "CANCEL_ORDER"`로 요청하며, 외부 Router가 같은 엔진 Worker에서
+이 함수를 호출한다. 통신 필드와 응답은 [백엔드 JSON 통신 명세](backend-json-api.md)를 참고한다.
+
 ## 7. 조회와 최근 체결가
 
 `order(orderId)`는 접수된 주문의 현재 상태를 조회한다. `orderBook()`은 가격별 대기 잔량을 합산해 매수는 높은 가격부터, 매도는 낮은 가격부터 반환한다.
@@ -114,7 +117,7 @@ WebSocket 주문 JSON을 `OrderRequest`로 변환하고 결과 구조체를 JSON
 - 시장가·정정·조건부 주문과 주문 만료
 - 영속화, 재시작 복구와 이벤트 로그
 - DB 트랜잭션, 계좌 잔고 검증, 자산 예약과 정산
-- 코어 내부 네트워크 API와 인증·인가 (외부 `Router`의 WebSocket 신규 주문 접수는 구현됨)
+- 코어 내부 네트워크 API와 인증·인가 (외부 `Router`의 WebSocket 신규 주문 접수·취소·현재가 조회는 구현됨)
 - 내부 동시성 제어, 다종목 라우팅과 방 스케줄링
 - 수수료, 호가 단위표 검증과 가격 제한폭
 - 외부 기준가·시세 API 연동

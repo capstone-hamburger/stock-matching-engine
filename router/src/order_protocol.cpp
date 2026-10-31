@@ -44,6 +44,30 @@ IncomingRequest parseRequest(std::string_view payload)
     }
 
     if (object.is_object() && object.contains("type")
+        && object.at("type") == "CANCEL_ORDER") {
+        constexpr std::array fields{"type", "stockId", "orderId", "userId"};
+        if (object.size() != fields.size()) {
+            throw PacketError{"INVALID_REQUEST",
+                "CANCEL_ORDER requires exactly type, stockId, orderId and userId"};
+        }
+        for (const auto* field : fields) {
+            if (!object.contains(field)) {
+                throw PacketError{"INVALID_REQUEST", std::string{"Missing field: "} + field};
+            }
+        }
+        CancelOrderRequest request{
+            .stockId = integer(object, "stockId", "INVALID_REQUEST"),
+            .orderId = integer(object, "orderId", "INVALID_REQUEST"),
+            .userId = integer(object, "userId", "INVALID_REQUEST"),
+        };
+        if (request.stockId <= 0) {
+            throw PacketError{"INVALID_REQUEST", "stockId must be positive"};
+        }
+        // Order/user ID value checks and ownership checks belong to Engine::cancel().
+        return request;
+    }
+
+    if (object.is_object() && object.contains("type")
         && object.at("type") == "GET_CURRENT_PRICE") {
         if (object.size() != 2 || !object.contains("stockId")) {
             throw PacketError{"INVALID_REQUEST",
@@ -95,6 +119,18 @@ std::string currentPriceResult(StockId stockId, std::optional<Price> price)
         {"event", "CURRENT_PRICE"},
         {"stockId", stockId},
         {"price", price ? Json(*price) : Json(nullptr)},
+    }.dump();
+}
+
+std::string cancellationResult(const CancelOrderRequest& request, const CancellationResult& result)
+{
+    return Json{
+        {"event", "CANCEL_RESULT"},
+        {"orderId", request.orderId},
+        {"stockId", request.stockId},
+        {"success", result.success},
+        {"canceledQuantity", result.canceledQuantity},
+        {"failureReason", toString(result.failureReason)},
     }.dump();
 }
 

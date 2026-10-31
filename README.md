@@ -15,6 +15,9 @@ WebSocket 라우터는 별도 I/O 스레드에서 ERD `Order` JSON을 받고, �
 [`docs/websocket-router.md`](docs/websocket-router.md)를 참고하세요.
 현재가 조회는 `type: "GET_CURRENT_PRICE"` 요청으로 제공하며,
 사용법은 [현재가 조회 기능](docs/current-price.md)을 참고하세요.
+취소는 `type: "CANCEL_ORDER"`와 `stockId`, `orderId`, `userId`로 요청합니다.
+모든 요청·응답 JSON, `type`별 의미와 오류 코드는 노션에 가져올 수 있는
+[백엔드 JSON 통신 명세](docs/backend-json-api.md)에 정리되어 있습니다.
 초기화부터 종료까지 함수별 호출 순서와 컨텍스트 이동은
 [`docs/websocket-router-flow.md`](docs/websocket-router-flow.md)에 설명되어 있습니다.
 
@@ -84,4 +87,4 @@ tests/      테스트 실행 파일
 ```
 
 DB, 잔고 검증과 계좌 정산은 구현하지 않았습니다. WebSocket 라우터는 현재 신규
-BUY/SELL 주문 접수와 현재가 조회를 제공하며 인증·TLS, 취소·기타 조회 API와 체결 알림 방송은 후속 범위입니다.
+BUY/SELL 주문 접수, 미체결 잔량 취소와 현재가 조회를 제공하며 인증·TLS, 기타 조회 API와 체결 알림 방송은 후속 범위입니다.

@@ -229,15 +229,18 @@ private:
             try {
                 if (const auto* order = std::get_if<protocol::IncomingOrder>(&request)) {
                     response = protocol::orderResult(*order, engine_.submit(order->request));
+                } else if (const auto* cancel = std::get_if<protocol::CancelOrderRequest>(&request)) {
+                    response = protocol::cancellationResult(*cancel,
+                        engine_.cancel(cancel->orderId, cancel->userId));
                 } else {
                     response = protocol::currentPriceResult(engine_.stockId(), engine_.lastTradePrice());
                 }
             } catch (const std::exception& error) {
                 std::cerr << "Request processing failed: " << error.what() << '\n';
-                const bool isOrder = std::holds_alternative<protocol::IncomingOrder>(request);
-                response = protocol::error("INTERNAL_ERROR", isOrder
-                    ? "Order outcome is unknown; do not retry blindly"
-                    : "Current price query failed");
+                const bool isQuery = std::holds_alternative<protocol::CurrentPriceRequest>(request);
+                response = protocol::error("INTERNAL_ERROR", isQuery
+                    ? "Current price query failed"
+                    : "Order or cancellation outcome is unknown; do not retry blindly");
             }
             net::post(ioContext_, [client, response = std::move(response)]() mutable {
                 if (const auto session = client.lock()) {

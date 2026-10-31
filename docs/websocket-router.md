@@ -2,6 +2,8 @@
 
 초기화부터 연결·수신·매칭·응답·종료까지 함수와 실행 컨텍스트를 따라가는 설명은
 [라우터 실행 흐름](websocket-router-flow.md)에 정리되어 있습니다.
+백엔드 연동용 전체 요청·응답 JSON과 타입·오류 코드 표는
+[백엔드 JSON 통신 명세](backend-json-api.md)를 참고하세요.
 
 ## 실행과 기본 설정
 
@@ -16,7 +18,7 @@ cmake --build --preset dev
 - 라이브러리: Boost.Beast/Asio, nlohmann/json
 - 요청 한도: WebSocket 메시지 하나당 16 KiB
 - 연결 한도: 미완료 핸드셰이크를 포함해 128개
-- 메시지 유형: UTF-8 JSON text, 메시지 하나에 주문 또는 조회 요청 하나
+- 메시지 유형: UTF-8 JSON text, 메시지 하나에 주문·취소·조회 요청 중 하나
 
 `matching_engine_server [address [port [stockId]]]`로 기본값을 바꿀 수 있습니다.
 다른 호스트의 백엔드에서 접속하려면 적절한 인터페이스 주소나 `0.0.0.0`으로
@@ -41,7 +43,7 @@ flowchart LR
 **작업 스레드 2개 + 대기 중인 main 스레드 1개**로 구성됩니다.
 
 I/O 스레드는 accept, WebSocket handshake, read/write, JSON 파싱·검증과 종목 선택을
-담당합니다. 엔진 스레드만 `Engine::submit()`과 `Engine::lastTradePrice()`를 호출합니다. 코어 엔진의 동기 API와
+담당합니다. 엔진 스레드만 `Engine::submit()`, `Engine::cancel()`, `Engine::lastTradePrice()`를 호출합니다. 코어 엔진의 동기 API와
 자료구조는 그대로이며, 엔진을 여러 스레드에서 공유하지 않습니다.
 
 한 연결에서는 `수신 → 엔진 처리 → 응답 전송 완료 → 다음 수신`을 반복합니다.
@@ -108,6 +110,33 @@ JavaScript 백엔드는 큰 bigint ID를 `Number`로 변환하면 정밀도를 �
 조회는 type과 stockId 두 필드만 받고 주문과 같은 Worker에서 처리합니다.
 자세한 검증 규칙과 사용법은 [현재가 조회 기능](current-price.md)을 참고하세요.
 
+## 주문 취소 요청
+
+```json
+{"type":"CANCEL_ORDER","stockId":1001,"orderId":2001,"userId":20}
+```
+
+네 필드만 허용합니다. 매수·매도 구분 없이 본인 주문의 미체결 잔량 전체를 취소합니다.
+`quantity`를 통한 일부 잔량 취소는 지원하지 않습니다. 이미 체결된 수량은 유지합니다.
+취소도 엔진 Worker에서 `Engine::cancel()`을 호출하고, 다음 형식으로 응답합니다.
+
+```json
+{
+  "event": "CANCEL_RESULT",
+  "orderId": 2001,
+  "stockId": 1001,
+  "success": true,
+  "canceledQuantity": 4,
+  "failureReason": "NONE"
+}
+```
+
+위 예시는 매도 7주 중 3주 체결 후 나머지 4주를 취소한 경우입니다.
+실패 시 `success=false`, `canceledQuantity=0`이며 `failureReason`으로
+`INVALID_ORDER_ID`, `INVALID_USER_ID`, `ORDER_NOT_FOUND`, `NOT_OWNER`,
+`ALREADY_FILLED`, `ALREADY_CANCELED` 중 하나를 반환합니다.
+취소는 마지막 체결 가격을 바꾸지 않으며 DB·자산 예약 해제는 백엔드의 책임입니다.
+
 ## 주문 응답
 
 위 매도 주문 뒤 매수 주문의 응답 예시입니다.
@@ -163,7 +192,7 @@ ERD에는 거절 상태가 없으므로 거절은 `status=null`과 `rejectionRea
 
 - `INVALID_JSON`: JSON 구문 오류 또는 과도한 중첩(깊이 8 초과)
 - `INVALID_ORDER`: 잘못된 필드 구성, 타입, enum, 정수 표현
-- `INVALID_REQUEST`: 현재가 조회 필드 구성 또는 stockId 타입·범위 오류
+- `INVALID_REQUEST`: 조회·취소의 필드 구성, ID 정수 표현 또는 stockId 범위 오류
 - `UNKNOWN_STOCK`: 등록되지 않은 종목
 - `TEXT_REQUIRED`: binary 메시지
 - `INTERNAL_ERROR`: 엔진 처리 또는 결과 생성 중 예외; 주문 반영 여부가 불확실할 수 있음
@@ -188,14 +217,15 @@ HTTP upgrade 이전에 TCP 연결을 닫습니다. 일반 close/ping/pong/fragme
 
 ## 범위와 검증
 
-현재는 단일 종목 BUY/SELL 접수와 현재가 조회용 내부 연동 MVP입니다. TLS, 인증, 잔고·보유수량 검증,
-DB 저장·정산, 취소/기타 조회 WebSocket API, 다종목 라우팅과 알림 방송은 구현하지 않았습니다.
+현재는 단일 종목 BUY/SELL 접수, 주문 취소와 현재가 조회용 내부 연동 MVP입니다. TLS, 인증, 잔고·보유수량 검증,
+DB 저장·정산, 기타 조회 WebSocket API, 다종목 라우팅과 알림 방송은 구현하지 않았습니다.
 기본 바인딩은 로컬 주소이며 공개 인터넷 서비스로 배포하는 설정이 아닙니다.
 
 `ctest --preset dev`는 기존 엔진 단위 테스트와 실제 loopback WebSocket 통합 테스트를
 실행합니다. 통합 테스트는 두 연결 간 체결, 부분 체결, 중복 ID, FIFO, 동시 요청,
 정수 범위, 오류 이후 연결 재사용, binary, fragmentation, ping, 연결/메시지 한도,
-미완료 핸드셰이크, 포트 충돌, 종료와 재바인딩을 확인합니다.
+미완료 핸드셰이크, 포트 충돌, 종료와 재바인딩을 확인합니다. 취소 검증에는 미체결·부분 체결
+잔량 취소, 소유자·상태 검사, 잘못된 입력, 주문 직후 취소와 체결 경합이 포함됩니다.
 
 구현 참고: [Boost.Beast 비동기 WebSocket 예제](https://github.com/boostorg/beast/blob/boost-1.83.0/example/websocket/server/async/websocket_server_async.cpp),
 [nlohmann/json 값 변환 API](https://json.nlohmann.me/api/basic_json/get/).

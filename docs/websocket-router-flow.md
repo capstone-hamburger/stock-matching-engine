@@ -18,7 +18,7 @@
 | --- | --- | --- |
 | main 스레드 | `main()` | 설정, 객체 생성, 시작, 종료 신호 대기, 종료 요청 |
 | I/O 스레드 `ioThread_` | `ioContext_.run()` | 연결·수신·송신 완료 콜백, JSON 검증, 종목 선택 |
-| 엔진 스레드 `engineThread_` | `engineContext_.run()` | 전달된 주문·조회 처리, Engine::submit()/lastTradePrice(), 결과 JSON 생성 |
+| 엔진 스레드 `engineThread_` | `engineContext_.run()` | 주문·취소·조회 처리, Engine::submit()/cancel()/lastTradePrice(), 결과 JSON 생성 |
 
 `io_context`는 비동기 작업과 완료 핸들러를 관리하는 실행 컨텍스트다. `run()`을 호출한
 스레드가 해당 컨텍스트의 핸들러를 실행한다. 코드의 `ioContext_{1}`과
@@ -114,7 +114,7 @@ ioThread_ = std::thread([this] { ioContext_.run(); });
 `Session` 생성자에는 소켓·메시지 크기 한도 외에 두 함수가 전달된다.
 
 ```cpp
-// Session::dispatch_에 보관: 파싱한 주문 또는 조회 요청을 Router로 전달
+// Session::dispatch_에 보관: 파싱한 주문·취소·조회 요청을 Router로 전달
 [this](protocol::IncomingRequest request, std::weak_ptr<Session> client) {
     dispatch(std::move(request), std::move(client));
 }
@@ -177,10 +177,13 @@ Beast가 분할된 메시지를 조립하면 완료 콜백이 실행된다.
 
 `protocol::parseRequest()`도 같은 I/O 스레드에서 동기 실행된다. JSON 구문·중첩 깊이,
 BUY/SELL은 일곱 필드와 status=PENDING을, GET_CURRENT_PRICE는 type·stockId 두 필드를 검사한다.
+CANCEL_ORDER는 type·stockId·orderId·userId 네 필드를 검사한다. 취소의 orderId·userId가
+0 이하인지는 엔진에서 검사하고, 숫자 표현이나 필드 구성 오류는 파서에서 거절한다.
 내부 `integer()`는 소수나 int64 범위 초과 값을 정수로 잘못 변환하지 않도록 검사한다.
 
-성공 결과 IncomingRequest는 IncomingOrder 또는 CurrentPriceRequest를 담는 variant다.
-IncomingOrder에는 stockId와 OrderRequest가, CurrentPriceRequest에는 stockId가 들어 있다.
+성공 결과 IncomingRequest는 IncomingOrder, CurrentPriceRequest, CancelOrderRequest 중 하나를 담는 variant다.
+IncomingOrder에는 stockId와 OrderRequest가, CurrentPriceRequest에는 stockId가,
+CancelOrderRequest에는 stockId·orderId·userId가 들어 있다.
 실패하면 `PacketError`를 던지고, 수신 콜백이 이를 잡아 `reply()`로 오류 JSON을 보낸다.
 이 오류 경로는 엔진 컨텍스트까지 가지 않는다.
 
@@ -216,6 +219,9 @@ I/O 스레드는 작업을 전달하고 자신의 이벤트 처리로 복귀한�
 ```cpp
 if (const auto* order = std::get_if<protocol::IncomingOrder>(&request)) {
     response = protocol::orderResult(*order, engine_.submit(order->request));
+} else if (const auto* cancel = std::get_if<protocol::CancelOrderRequest>(&request)) {
+    response = protocol::cancellationResult(*cancel,
+        engine_.cancel(cancel->orderId, cancel->userId));
 } else {
     response = protocol::currentPriceResult(engine_.stockId(), engine_.lastTradePrice());
 }
@@ -231,6 +237,12 @@ BUY/SELL 주문의 실제 함수 흐름은 다음과 같다.
 
 현재가 조회는 Engine::lastTradePrice()를 읽고 protocol::currentPriceResult()로 응답한다.
 조회는 엔진 상태를 변경하지 않으며, 최초 체결 전에는 price=null을 반환한다.
+
+취소는 Engine::cancel(orderId, userId) → Engine::Impl::cancel() 순서로 실행한다.
+엔진이 소유자와 주문 상태를 검사하고 미체결 잔량을 호가창에서 제거하면,
+protocol::cancellationResult()가 CANCEL_RESULT JSON을 생성한다. 이미 체결된 수량과
+현재가는 유지한다. 모든 작업이 같은 Worker에서 순차 처리되므로 체결·취소가 동시에
+같은 주문을 수정하지 않는다. 다른 연결에서 먼저 체결된 주문의 취소는 실패할 수 있다.
 
 이 함수들은 모두 **같은 엔진 스레드에서 동기적으로 실행**된다.
 `Engine::Impl`에 들어간다고 스레드가 다시 바뀌지 않는다. 결과 JSON 직렬화도 현재는
@@ -339,3 +351,4 @@ Session의 비동기 콜백도 `[self = shared_from_this()]`로 자신을 붙잡
 `Router`가 소멸할 때도 `Impl` 소멸자가 `stop()`을 호출하며, 이미 정지했다면 바로 반환한다.
 
 현재가 요청·응답과 오류 규칙은 [현재가 조회 기능](current-price.md)을 참고한다.
+취소를 포함한 모든 요청·응답 형식은 [백엔드 JSON 통신 명세](backend-json-api.md)를 참고한다.
