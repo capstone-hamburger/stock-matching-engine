@@ -7,6 +7,10 @@ C++20으로 작성하는 모의 주식 거래 매칭 엔진 MVP의 시작 프로
 공개 인터페이스 사용법은 [`docs/matching-engine-spec.md`](docs/matching-engine-spec.md)에
 정리되어 있습니다.
 
+다른 백엔드·프론트엔드 자료와 함께 정보 모델링, Use Case, ERD와 역할·일정을
+작성할 때에는 [통합 설계용 모듈 정리](docs/module-handoff.md)를 참고하세요.
+모듈별 기능·구현 상태·데이터·연동 책임과 AI 전달용 요청문을 담았습니다.
+
 엔진의 동기 실행 구조, 내부 함수 호출 관계, 자료구조와 멀티스레드 확장 방향은
 [`docs/matching-engine-architecture.md`](docs/matching-engine-architecture.md)에 정리되어 있습니다.
 
