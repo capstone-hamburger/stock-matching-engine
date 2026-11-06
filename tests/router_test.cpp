@@ -6,6 +6,7 @@
 #include <boost/beast/websocket.hpp>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <future>
 #include <iostream>
 #include <limits>
@@ -89,7 +90,11 @@ void testMatchingAndValidation()
     expect(result["accepted"] == true && result["status"] == "PENDING"
         && result["engineStatus"] == "OPEN" && result["remainingQuantity"] == 7,
         "sell must rest in the engine");
+    const auto beforeExecution = std::chrono::floor<std::chrono::milliseconds>(
+        std::chrono::system_clock::now()).time_since_epoch().count();
     result = buyer.request(order(1001, "BUY", 3, 10200));
+    const auto afterExecution = std::chrono::floor<std::chrono::milliseconds>(
+        std::chrono::system_clock::now()).time_since_epoch().count();
     expect(result["event"] == "ORDER_RESULT" && result["status"] == "COMPLETE"
         && result["engineStatus"] == "FILLED" && result["filledQuantity"] == 3,
         "buy must fill against another connection's sell");
@@ -97,6 +102,13 @@ void testMatchingAndValidation()
         && result["trades"][0]["sellOrderId"] == 2001
         && result["trades"][0]["buyOrderId"] == 1001,
         "response must contain the real engine trade at the resting price");
+    const auto& trade = result["trades"][0];
+    expect(trade.contains("executedAt") && trade["executedAt"].is_number_integer(),
+        "executedAt must be a JSON integer");
+    const auto executedAt = trade["executedAt"].get<std::int64_t>();
+    expect(executedAt >= beforeExecution && executedAt <= afterExecution,
+        "executedAt must be UTC epoch milliseconds at execution");
+    expect(!trade.contains("tradeAt"), "tradeAt must not be present in trade JSON");
 
     result = buyer.request(order(1002, "BUY", 6, 10200));
     expect(result["status"] == "PENDING" && result["engineStatus"] == "PARTIALLY_FILLED"

@@ -149,6 +149,7 @@ std::string orderResult(const IncomingOrder& order, const SubmissionResult& resu
             {"sellOrderId", trade.sellOrderId},
             {"price", trade.price},
             {"quantity", trade.quantity},
+            {"executedAt", trade.executedAt},
         });
     }
     // The ERD has no rejected/partially-filled status. Preserve detail separately.
