@@ -1,6 +1,7 @@
 #include "matching_engine/engine.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -369,6 +370,8 @@ private:
             .sellOrderId = incoming.type == OrderType::Sell ? incoming.orderId : resting.orderId,
             .price = resting.price,
             .quantity = tradedQuantity,
+            .executedAt = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count(),
         });
 
         if (tradeId == std::numeric_limits<TradeId>::max()) {

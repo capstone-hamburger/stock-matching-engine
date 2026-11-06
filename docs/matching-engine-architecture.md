@@ -85,6 +85,12 @@ struct OrderRequest {
 | `price` | 지정가 | 1 이상 `INT32_MAX` 이하 |
 | `quantity` | 주문수량 | 1 이상 `INT32_MAX` 이하 |
 
+### `Trade`
+
+체결 결과는 `tradeId`, `buyOrderId`, `sellOrderId`, `price`, `quantity`, `executedAt`을 포함한다.
+`executedAt`은 `std::int64_t`이며 `executeTrade()`에서 체결 생성 시 시스템 시계를 읽어 기록한다.
+기준은 `1970-01-01T00:00:00Z`이고 단위는 밀리초다. 라우터는 저장된 값을 JSON 정수로 그대로 직렬화한다.
+
 ## 4. 공개 함수
 
 | 함수 | 필요한 인자 | 반환값 | 기능 |

@@ -1,5 +1,6 @@
 #include "matching_engine/engine.hpp"
 
+#include <chrono>
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
@@ -117,12 +118,20 @@ void testBuyPriceTimePriorityAndContinuousMatching(TestContext& test)
     test.expect(!engine.lastTradePrice().has_value(),
         "resting orders must not set a last trade price");
 
+    const auto beforeExecution = std::chrono::floor<std::chrono::milliseconds>(
+        std::chrono::system_clock::now()).time_since_epoch().count();
     const auto result = engine.submit(request(20, 5, OrderType::Buy, 102, 8));
+    const auto afterExecution = std::chrono::floor<std::chrono::milliseconds>(
+        std::chrono::system_clock::now()).time_since_epoch().count();
     test.expect(result.accepted && result.status == OrderStatus::Filled,
         "crossing buy must fill completely");
     test.expect(result.filledQuantity == 8 && result.remainingQuantity == 0,
         "buy fill quantities must match");
     test.expect(result.trades.size() == 3, "buy must match three resting orders");
+    for (const auto& trade : result.trades) {
+        test.expect(trade.executedAt >= beforeExecution && trade.executedAt <= afterExecution,
+            "each trade must record execution time in UTC epoch milliseconds");
+    }
 
     if (result.trades.size() == 3) {
         test.expect(result.trades[0].tradeId == 1

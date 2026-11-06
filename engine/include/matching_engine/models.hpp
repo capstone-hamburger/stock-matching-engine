@@ -62,6 +62,7 @@ struct Trade {
     OrderId sellOrderId;
     Price price;
     Quantity quantity;
+    std::int64_t executedAt; // Milliseconds since 1970-01-01T00:00:00Z (UTC).
 };
 
 struct SubmissionResult {

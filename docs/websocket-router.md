@@ -158,11 +158,16 @@ JavaScript 백엔드는 큰 bigint ID를 `Number`로 변환하면 정밀도를 �
       "buyOrderId": 1001,
       "sellOrderId": 2001,
       "price": 10100,
-      "quantity": 3
+      "quantity": 3,
+      "executedAt": 1793923200123
     }
   ]
 }
 ```
+
+`trades`의 각 객체는 체결 시각 `executedAt`을 JSON 정수로 포함합니다.
+엔진이 체결할 때 서버 시스템 시계로 기록하며, `1970-01-01T00:00:00Z`부터 경과한 UTC epoch 밀리초입니다.
+예시의 `1793923200123`은 `2026-11-06T00:00:00.123Z`를 뜻하며, `tradeAt` 필드는 반환하지 않습니다.
 
 | 엔진 결과 | `accepted` | ERD `status` | `engineStatus` |
 | --- | --- | --- | --- |
