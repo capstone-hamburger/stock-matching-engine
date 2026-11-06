@@ -26,9 +26,6 @@ struct OrderRecord {
     OrderStatus status{OrderStatus::Open};
 };
 
-using BidBook = std::map<Price, std::deque<OrderId>, std::greater<Price>>;
-using AskBook = std::map<Price, std::deque<OrderId>, std::less<Price>>;
-
 [[nodiscard]] bool isValidOrderType(OrderType type) noexcept
 {
     return type == OrderType::Buy || type == OrderType::Sell;
@@ -64,6 +61,14 @@ using AskBook = std::map<Price, std::deque<OrderId>, std::less<Price>>;
 } // namespace
 
 class Engine::Impl final {
+    struct PriceLevel {
+        std::deque<OrderId> queue;
+        Quantity PriceQuantity{0};
+    };
+
+    using BidBook = std::map<Price, PriceLevel, std::greater<Price>>;
+    using AskBook = std::map<Price, PriceLevel, std::less<Price>>;
+
 public:
     explicit Impl(StockId stockId)
         : stockId_(stockId)
@@ -184,11 +189,11 @@ public:
         result.bids.reserve(bids_.size());
         result.asks.reserve(asks_.size());
 
-        for (const auto& [price, queue] : bids_) {
-            result.bids.push_back({price, levelQuantity(queue)});
+        for (const auto& [price, level] : bids_) {
+            result.bids.push_back({price, level.PriceQuantity});
         }
-        for (const auto& [price, queue] : asks_) {
-            result.asks.push_back({price, levelQuantity(queue)});
+        for (const auto& [price, level] : asks_) {
+            result.asks.push_back({price, level.PriceQuantity});
         }
         return result;
     }
@@ -244,18 +249,18 @@ private:
         };
 
         if (request.type == OrderType::Buy) {
-            for (const auto& [price, queue] : asks_) {
+            for (const auto& [price, level] : asks_) {
                 if (price > request.price || result.remainingQuantity == 0) {
                     break;
                 }
-                visitQueue(queue);
+                visitQueue(level.queue);
             }
         } else {
-            for (const auto& [price, queue] : bids_) {
+            for (const auto& [price, level] : bids_) {
                 if (price < request.price || result.remainingQuantity == 0) {
                     break;
                 }
-                visitQueue(queue);
+                visitQueue(level.queue);
             }
         }
         return result;
@@ -289,25 +294,16 @@ private:
         if (type == OrderType::Buy) {
             const auto iterator = bids_.find(price);
             if (iterator != bids_.end()) {
-                current = levelQuantity(iterator->second);
+                current = iterator->second.PriceQuantity;
             }
         } else {
             const auto iterator = asks_.find(price);
             if (iterator != asks_.end()) {
-                current = levelQuantity(iterator->second);
+                current = iterator->second.PriceQuantity;
             }
         }
 
         return current <= std::numeric_limits<Quantity>::max() - quantity;
-    }
-
-    [[nodiscard]] Quantity levelQuantity(const std::deque<OrderId>& queue) const
-    {
-        Quantity total = 0;
-        for (const OrderId orderId : queue) {
-            total += orders_.at(orderId).remainingQuantity;
-        }
-        return total;
     }
 
     void matchBuy(OrderRecord& incoming, std::vector<Trade>& trades)
@@ -318,10 +314,10 @@ private:
                 break;
             }
 
-            auto& queue = level->second;
+            auto& queue = level->second.queue;
             while (incoming.remainingQuantity > 0 && !queue.empty()) {
                 OrderRecord& resting = orders_.at(queue.front());
-                executeTrade(incoming, resting, trades);
+                executeTrade(incoming, resting, level->second, trades);
                 if (resting.remainingQuantity == 0) {
                     queue.pop_front();
                 }
@@ -341,10 +337,10 @@ private:
                 break;
             }
 
-            auto& queue = level->second;
+            auto& queue = level->second.queue;
             while (incoming.remainingQuantity > 0 && !queue.empty()) {
                 OrderRecord& resting = orders_.at(queue.front());
-                executeTrade(incoming, resting, trades);
+                executeTrade(incoming, resting, level->second, trades);
                 if (resting.remainingQuantity == 0) {
                     queue.pop_front();
                 }
@@ -356,7 +352,11 @@ private:
         }
     }
 
-    void executeTrade(OrderRecord& incoming, OrderRecord& resting, std::vector<Trade>& trades)
+    void executeTrade(
+        OrderRecord& incoming,
+        OrderRecord& resting,
+        PriceLevel& restingLevel,
+        std::vector<Trade>& trades)
     {
         const Quantity tradedQuantity = std::min(
             incoming.remainingQuantity,
@@ -381,6 +381,7 @@ private:
         incoming.remainingQuantity -= tradedQuantity;
         resting.filledQuantity += tradedQuantity;
         resting.remainingQuantity -= tradedQuantity;
+        restingLevel.PriceQuantity -= tradedQuantity;
         resting.status = resting.remainingQuantity == 0 ? OrderStatus::Filled
                                                         : OrderStatus::PartiallyFilled;
         lastTradePrice_ = resting.price;
@@ -388,11 +389,9 @@ private:
 
     void addToBook(const OrderRecord& order)
     {
-        if (order.type == OrderType::Buy) {
-            bids_[order.price].push_back(order.orderId);
-        } else {
-            asks_[order.price].push_back(order.orderId);
-        }
+        auto& level = order.type == OrderType::Buy ? bids_[order.price] : asks_[order.price];
+        level.queue.push_back(order.orderId);
+        level.PriceQuantity += order.remainingQuantity;
     }
 
     void removeFromBook(const OrderRecord& order)
@@ -403,10 +402,11 @@ private:
                 return;
             }
 
-            auto& queue = level->second;
+            auto& queue = level->second.queue;
             const auto position = std::find(queue.begin(), queue.end(), order.orderId);
             if (position != queue.end()) {
                 queue.erase(position);
+                level->second.PriceQuantity -= order.remainingQuantity;
             }
             if (queue.empty()) {
                 book.erase(level);
