@@ -420,6 +420,112 @@ void testOrderingAndConcurrentConnections()
     client.ws.close(websocket::close_code::normal);
 }
 
+void testMarketDataStream()
+{
+    using namespace std::chrono_literals;
+    expect(RouterConfig{}.marketDataInterval == 5s, "default snapshot tick must be five seconds");
+    Router router{RouterConfig{.port = 0, .marketDataInterval = 25ms}};
+    router.start();
+    Client feed{router.port()};
+    Client orders{router.port()};
+    const Json subscribe{{"type", "SUBSCRIBE_ORDER_BOOK"}, {"stockId", 1001}};
+    const Json unsubscribe{{"type", "UNSUBSCRIBE_ORDER_BOOK"}, {"stockId", 1001}};
+    const Json unsubscribed{{"event", "ORDER_BOOK_UNSUBSCRIBED"}, {"stockId", 1001}};
+    expect(feed.request(unsubscribe) == unsubscribed, "a new session can confirm it is unsubscribed");
+    auto invalid = subscribe;
+    invalid["stockId"] = 2002;
+    expect(feed.request(invalid)["code"] == "UNKNOWN_STOCK", "only the configured stock has a feed");
+    invalid = subscribe;
+    invalid["depth"] = 10;
+    expect(feed.request(invalid)["code"] == "INVALID_REQUEST", "subscribe must validate fields");
+    const Json subscribed{{"event", "ORDER_BOOK_SUBSCRIBED"}, {"stockId", 1001}};
+    expect(feed.request(subscribe) == subscribed, "subscription must be acknowledged first");
+
+    const auto level = [](int price, int quantity) {
+        return Json{{"price", price}, {"quantity", quantity}};
+    };
+    Json book{{"event", "ORDER_BOOK_SNAPSHOT"}, {"stockId", 1001},
+        {"bids", Json::array()}, {"asks", Json::array()}};
+    // Frames from earlier ticks can already be buffered while orders are being submitted.
+    const auto awaitBook = [&book](Client& client) {
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        do {
+            const auto frame = client.receive();
+            expect(frame.at("event") == "ORDER_BOOK_SNAPSHOT", "feed must carry snapshot events");
+            if (frame == book) {
+                return;
+            }
+        } while (std::chrono::steady_clock::now() < deadline);
+        throw std::runtime_error{"snapshot did not converge to " + book.dump()};
+    };
+    awaitBook(feed);
+    awaitBook(feed); // The timer publishes even without orders.
+
+    for (int i = 0; i < 6; ++i) {
+        expect(orders.request(order(10 + i, "BUY", 1, 100 - i)).at("accepted") == true,
+            "unsubscribed client must receive only its replies");
+        expect(orders.request(order(20 + i, "SELL", 4, 101 + i)).at("accepted") == true,
+            "sell level must rest");
+        if (i < 5) {
+            book["bids"].push_back(level(100 - i, 1));
+            book["asks"].push_back(level(101 + i, 4));
+        }
+    }
+    expect(orders.request(order(30, "SELL", 2, 101)).at("accepted") == true,
+        "same-price order must rest");
+    book["asks"][0] = level(101, 6);
+    awaitBook(feed);
+
+    // Consume both orders at 101 and part of the level at 102. The sixth ask moves up.
+    expect(orders.request(order(31, "BUY", 7, 102)).at("trades").size() == 3,
+        "sweep must generate three fills");
+    book["asks"].erase(book["asks"].begin());
+    book["asks"][0] = level(102, 3);
+    book["asks"].push_back(level(106, 4));
+    awaitBook(feed);
+
+    expect(orders.request(cancellation(10, 10)).at("success") == true, "best bid must cancel");
+    book["bids"].erase(book["bids"].begin());
+    book["bids"].push_back(level(95, 1));
+    awaitBook(feed);
+    Client peer{router.port()};
+    expect(peer.request(subscribe) == subscribed, "a second backend can subscribe independently");
+    awaitBook(peer);
+
+    const Json query{{"type", "GET_CURRENT_PRICE"}, {"stockId", 1001}};
+    const auto requestOnFeed = [&](const Json& packet) {
+        feed.send(packet);
+        auto frame = feed.receive();
+        while (frame.at("event") == "ORDER_BOOK_SNAPSHOT") {
+            expect(frame == book, "snapshots may arrive between a request and its reply");
+            frame = feed.receive();
+        }
+        return frame;
+    };
+    expect(requestOnFeed(query).at("event") == "CURRENT_PRICE", "subscribed session can query");
+    invalid = unsubscribe;
+    invalid["stockId"] = 2002;
+    expect(requestOnFeed(invalid).at("code") == "UNKNOWN_STOCK", "wrong stock cannot unsubscribe");
+    invalid.erase("stockId");
+    expect(requestOnFeed(invalid).at("code") == "INVALID_REQUEST", "unsubscribe requires stockId");
+    invalid = unsubscribe;
+    invalid["depth"] = 5;
+    expect(requestOnFeed(invalid).at("code") == "INVALID_REQUEST", "unsubscribe rejects extra fields");
+    awaitBook(feed);
+
+    expect(requestOnFeed(unsubscribe) == unsubscribed, "unsubscribe must acknowledge the stock");
+    expect(feed.request(order(32, "SELL", 1, 102)).at("accepted") == true,
+        "unsubscribed session must still accept orders");
+    book["asks"][0] = level(102, 4);
+    awaitBook(peer); // A tick with the new order must occur after the acknowledgement.
+    expect(feed.request(query).at("event") == "CURRENT_PRICE", "no snapshots may follow unsubscribe");
+    expect(feed.request(unsubscribe) == unsubscribed, "repeating unsubscribe must succeed");
+    expect(feed.request(subscribe) == subscribed, "same session must be able to subscribe again");
+    awaitBook(feed);
+    feed.ws.close(websocket::close_code::normal);
+    awaitBook(peer);
+}
+
 void testLifecycleAndLimits()
 {
     Router neverStarted;
@@ -431,6 +537,13 @@ void testLifecycleAndLimits()
         invalidConfig = true;
     }
     expect(invalidConfig, "invalid engine config must fail before starting threads");
+    invalidConfig = false;
+    try {
+        Router invalid{RouterConfig{.marketDataInterval = std::chrono::milliseconds{0}}};
+    } catch (const std::invalid_argument&) {
+        invalidConfig = true;
+    }
+    expect(invalidConfig, "a zero tick must fail before starting threads");
 
     Router router{RouterConfig{.port = 0, .maxMessageBytes = 1024}};
     router.start();
@@ -488,6 +601,7 @@ int main()
         testCancellationValidation();
         testCancellationCompetingWithFill();
         testOrderingAndConcurrentConnections();
+        testMarketDataStream();
         testLifecycleAndLimits();
         std::cout << "WebSocket router integration tests passed.\n";
     } catch (const std::exception& error) {

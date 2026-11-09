@@ -1,6 +1,7 @@
 #include "matching_engine/router.hpp"
 
 #include "matching_engine/engine.hpp"
+#include "market_data_publisher.hpp"
 #include "order_protocol.hpp"
 
 #include <utility>
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <functional>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
@@ -66,19 +68,61 @@ public:
         if (closed_) {
             return;
         }
-        output_ = std::move(response);
+        // Reads resume after their reply completes, so at most one reply can wait.
+        if (!output_.empty()) {
+            pendingReply_ = std::move(response);
+            return;
+        }
+        write(std::move(response), true);
+    }
+
+    void setOrderBookSubscription(const protocol::OrderBookSubscriptionRequest& request)
+    {
+        subscribed_ = request.subscribe;
+        if (!subscribed_) {
+            pendingSnapshot_.reset();
+        }
+        reply(protocol::orderBookSubscriptionResult(request.stockId, subscribed_));
+    }
+
+    void publish(const std::string& snapshot)
+    {
+        if (!subscribed_ || closed_) {
+            return;
+        }
+        if (output_.empty()) {
+            write(snapshot, false);
+        } else {
+            pendingSnapshot_ = snapshot;
+        }
+    }
+
+private:
+    void write(std::string message, bool resumeRead)
+    {
+        output_ = std::move(message);
         ws_.async_write(net::buffer(output_),
-            [self = shared_from_this()](ErrorCode ec, std::size_t) {
-                if (ec) {
+            [self = shared_from_this(), resumeRead](ErrorCode ec, std::size_t) {
+                if (ec || self->closed_) {
                     self->stop();
-                } else {
-                    self->output_.clear();
+                    return;
+                }
+                self->output_.clear();
+                if (resumeRead) {
                     self->read();
+                }
+                if (self->pendingReply_) {
+                    auto reply = std::move(*self->pendingReply_);
+                    self->pendingReply_.reset();
+                    self->write(std::move(reply), true);
+                } else if (self->pendingSnapshot_) {
+                    auto snapshot = std::move(*self->pendingSnapshot_);
+                    self->pendingSnapshot_.reset();
+                    self->write(std::move(snapshot), false);
                 }
             });
     }
 
-private:
     void read()
     {
         if (closed_) {
@@ -108,9 +152,12 @@ private:
     websocket::stream<beast::tcp_stream> ws_;
     beast::flat_buffer input_;
     std::string output_;
+    std::optional<std::string> pendingReply_;
+    std::optional<std::string> pendingSnapshot_;
     Dispatch dispatch_;
     OnClose onClose_;
     bool closed_{false};
+    bool subscribed_{false};
 };
 
 } // namespace
@@ -118,7 +165,11 @@ private:
 class Router::Impl final {
 public:
     explicit Impl(RouterConfig config)
-        : config_(std::move(config)), engine_(config_.stockId)
+        : config_(std::move(config)), engine_(config_.stockId),
+          publisher_(engineContext_, engine_, config_.marketDataInterval,
+              [this](StockId stockId, const OrderBookSnapshot& snapshot) {
+                  broadcast(stockId, snapshot);
+              })
     {
         if (config_.maxMessageBytes == 0 || config_.maxConnections == 0) {
             throw std::invalid_argument{"Router limits must be positive"};
@@ -141,12 +192,14 @@ public:
             acceptor_.listen(net::socket_base::max_listen_connections);
             port_ = acceptor_.local_endpoint().port();
             accept();
+            publisher_.start();
             engineThread_ = std::thread([this] { engineContext_.run(); });
             ioThread_ = std::thread([this] { ioContext_.run(); });
             running_ = true;
         } catch (...) {
             ErrorCode ignored;
             acceptor_.close(ignored);
+            engineContext_.stop();
             engineWork_.reset();
             if (engineThread_.joinable()) {
                 engineThread_.join();
@@ -172,6 +225,7 @@ public:
                 const auto session = *sessions_.begin();
                 session->stop();
             }
+            net::post(engineContext_, [this] { publisher_.stop(); });
             engineWork_.reset();
         });
         // run() finishes after all previously queued engine requests finish.
@@ -184,6 +238,16 @@ public:
     [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
 
 private:
+    void broadcast(StockId stockId, const OrderBookSnapshot& snapshot)
+    {
+        net::post(ioContext_, [this, stockId, snapshot] {
+            const auto message = protocol::orderBookSnapshot(stockId, snapshot);
+            for (const auto& session : sessions_) {
+                session->publish(message);
+            }
+        });
+    }
+
     void accept()
     {
         acceptor_.async_accept([this](ErrorCode ec, Tcp::socket socket) {
@@ -223,15 +287,28 @@ private:
             }
             return;
         }
+        if (const auto* subscription = std::get_if<protocol::OrderBookSubscriptionRequest>(&request)) {
+            if (const auto session = client.lock()) {
+                session->setOrderBookSubscription(*subscription);
+            }
+            return;
+        }
         // Asio's task queue is the thread boundary. Only this worker touches Engine.
         net::post(engineContext_, [this, request = std::move(request), client = std::move(client)] {
             std::string response;
             try {
                 if (const auto* order = std::get_if<protocol::IncomingOrder>(&request)) {
-                    response = protocol::orderResult(*order, engine_.submit(order->request));
+                    const auto result = engine_.submit(order->request);
+                    if (result.accepted) {
+                        publisher_.refresh();
+                    }
+                    response = protocol::orderResult(*order, result);
                 } else if (const auto* cancel = std::get_if<protocol::CancelOrderRequest>(&request)) {
-                    response = protocol::cancellationResult(*cancel,
-                        engine_.cancel(cancel->orderId, cancel->userId));
+                    const auto result = engine_.cancel(cancel->orderId, cancel->userId);
+                    if (result.success) {
+                        publisher_.refresh();
+                    }
+                    response = protocol::cancellationResult(*cancel, result);
                 } else {
                     response = protocol::currentPriceResult(engine_.stockId(), engine_.lastTradePrice());
                 }
@@ -259,6 +336,7 @@ private:
     Tcp::acceptor acceptor_{ioContext_};
     net::steady_timer acceptRetry_{ioContext_};
     Engine engine_;
+    MarketDataPublisher publisher_;
     std::unordered_set<std::shared_ptr<Session>> sessions_;
     std::thread engineThread_;
     std::thread ioThread_;

@@ -176,12 +176,12 @@ Beast가 분할된 메시지를 조립하면 완료 콜백이 실행된다.
 7. 파싱에 성공하면 `dispatch_(std::move(request), self)`로 Router에 전달한다.
 
 `protocol::parseRequest()`도 같은 I/O 스레드에서 동기 실행된다. JSON 구문·중첩 깊이,
-BUY/SELL은 일곱 필드와 status=PENDING을, GET_CURRENT_PRICE는 type·stockId 두 필드를 검사한다.
+BUY/SELL은 일곱 필드와 status=PENDING을, GET_CURRENT_PRICE와 호가 구독·해제 요청은 type·stockId 두 필드를 검사한다.
 CANCEL_ORDER는 type·stockId·orderId·userId 네 필드를 검사한다. 취소의 orderId·userId가
 0 이하인지는 엔진에서 검사하고, 숫자 표현이나 필드 구성 오류는 파서에서 거절한다.
 내부 `integer()`는 소수나 int64 범위 초과 값을 정수로 잘못 변환하지 않도록 검사한다.
 
-성공 결과 IncomingRequest는 IncomingOrder, CurrentPriceRequest, CancelOrderRequest 중 하나를 담는 variant다.
+성공 결과 IncomingRequest는 IncomingOrder, CurrentPriceRequest, CancelOrderRequest, OrderBookSubscriptionRequest 중 하나를 담는 variant다.
 IncomingOrder에는 stockId와 OrderRequest가, CurrentPriceRequest에는 stockId가,
 CancelOrderRequest에는 stockId·orderId·userId가 들어 있다.
 실패하면 `PacketError`를 던지고, 수신 콜백이 이를 잡아 `reply()`로 오류 JSON을 보낸다.
@@ -195,7 +195,10 @@ CancelOrderRequest에는 stockId·orderId·userId가 들어 있다.
 std::visit으로 요청의 stockId를 꺼내 등록된 config_.stockId와 비교한다.
 다르면 I/O 스레드에서 `UNKNOWN_STOCK`을 응답하고 끝낸다.
 
-종목이 맞으면 다음 부분에서 엔진 작업을 전달한다.
+종목이 맞고 요청이 `SUBSCRIBE_ORDER_BOOK` 또는 `UNSUBSCRIBE_ORDER_BOOK`이면 I/O 스레드에서 해당 세션의 구독 상태를 변경한다.
+구독 해제 시 전송 대기 중인 스냅샷을 비우고 `ORDER_BOOK_UNSUBSCRIBED`로 응답한다. 이미 전송 중인 스냅샷은 이 응답보다 먼저 도착할 수 있다. 다른 세션은 계속 발행 대상이 될 수 있다.
+
+주문·주문 취소·현재가 조회는 다음 부분에서 엔진 작업을 전달한다.
 
 ```cpp
 net::post(engineContext_, [this, request = std::move(request), client = std::move(client)] {

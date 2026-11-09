@@ -6,6 +6,7 @@
 
 엔진 코어 내부에는 외부 요청 작업 큐가 없다. 새 WebSocket `Router`는 코어 바깥에서
 별도 I/O 스레드와 엔진 Worker 스레드를 실행하고, Asio 작업 큐를 통해 주문을 전달한다.
+호가 스냅샷 발행 타이머는 엔진 Worker에서 실행한다. I/O 스레드는 연결별 구독·해제를 처리하며 구독 중인 연결에만 스냅샷을 보낸다.
 호가 가격별 `Engine::Impl::PriceLevel`은 가격-시간 우선순위를 위한 `std::deque<OrderId>`와 해당 가격의 대기 잔량 합계인 `PriceQuantity`를 보관한다.
 네트워크 실행 계층은 [WebSocket 라우터 문서](websocket-router.md)를 참고한다.
 

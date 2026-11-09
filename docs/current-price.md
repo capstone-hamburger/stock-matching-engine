@@ -77,8 +77,7 @@
 | INTERNAL_ERROR | 조회 처리 또는 응답 생성 실패 |
 
 오류 응답은 기존 ERROR event와 code, message 필드를 사용한다.
-지원되는 요청 타입은 BUY, SELL, GET_CURRENT_PRICE, CANCEL_ORDER다.
-그 밖의 타입은 기존 주문 검증 경로에서 INVALID_ORDER로 거절된다.
+같은 연결에서 `UNSUBSCRIBE_ORDER_BOOK`으로 호가 구독을 해제한 뒤에도 `GET_CURRENT_PRICE`로 현재가를 조회할 수 있다.
 전체 타입과 JSON 예시는 [백엔드 JSON 통신 명세](backend-json-api.md)를 참고한다.
 
 ## 차트 기능과의 관계

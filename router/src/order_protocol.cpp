@@ -68,16 +68,20 @@ IncomingRequest parseRequest(std::string_view payload)
     }
 
     if (object.is_object() && object.contains("type")
-        && object.at("type") == "GET_CURRENT_PRICE") {
+        && (object.at("type") == "GET_CURRENT_PRICE" || object.at("type") == "SUBSCRIBE_ORDER_BOOK"
+            || object.at("type") == "UNSUBSCRIBE_ORDER_BOOK")) {
         if (object.size() != 2 || !object.contains("stockId")) {
             throw PacketError{"INVALID_REQUEST",
-                "GET_CURRENT_PRICE requires exactly type and stockId"};
+                object.at("type").get<std::string>() + " requires exactly type and stockId"};
         }
         const auto stockId = integer(object, "stockId", "INVALID_REQUEST");
         if (stockId <= 0) {
             throw PacketError{"INVALID_REQUEST", "stockId must be positive"};
         }
-        return CurrentPriceRequest{stockId};
+        if (object.at("type") == "GET_CURRENT_PRICE") {
+            return CurrentPriceRequest{stockId};
+        }
+        return OrderBookSubscriptionRequest{stockId, object.at("type") == "SUBSCRIBE_ORDER_BOOK"};
     }
 
     constexpr std::array fields{"orderId", "userId", "stockId", "status", "quantity", "price", "type"};
@@ -111,6 +115,27 @@ IncomingRequest parseRequest(std::string_view payload)
         throw PacketError{"INVALID_ORDER", "stockId must be positive"};
     }
     return order;
+}
+
+std::string orderBookSubscriptionResult(StockId stockId, bool subscribed)
+{
+    return Json{{"event", subscribed ? "ORDER_BOOK_SUBSCRIBED" : "ORDER_BOOK_UNSUBSCRIBED"},
+        {"stockId", stockId}}.dump();
+}
+
+std::string orderBookSnapshot(StockId stockId, const OrderBookSnapshot& snapshot)
+{
+    const auto levels = [](const std::vector<PriceLevel>& side) {
+        auto array = Json::array();
+        for (const auto& level : side) {
+            array.push_back({{"price", level.price}, {"quantity", level.quantity}});
+        }
+        return array;
+    };
+    return Json{
+        {"event", "ORDER_BOOK_SNAPSHOT"}, {"stockId", stockId},
+        {"bids", levels(snapshot.bids)}, {"asks", levels(snapshot.asks)},
+    }.dump();
 }
 
 std::string currentPriceResult(StockId stockId, std::optional<Price> price)

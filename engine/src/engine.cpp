@@ -184,19 +184,19 @@ public:
         return snapshot(iterator->second);
     }
 
-    [[nodiscard]] OrderBookSnapshot orderBook() const
+    [[nodiscard]] OrderBookSnapshot orderBook(std::size_t depth) const
     {
-        OrderBookSnapshot result;
-        result.bids.reserve(bids_.size());
-        result.asks.reserve(asks_.size());
-
-        for (const auto& [price, level] : bids_) {
-            result.bids.push_back({price, level.PriceQuantity});
-        }
-        for (const auto& [price, level] : asks_) {
-            result.asks.push_back({price, level.PriceQuantity});
-        }
-        return result;
+        const auto levels = [depth](const auto& book) {
+            std::vector<matching_engine::PriceLevel> result;
+            const auto count = std::min(depth, book.size());
+            result.reserve(count);
+            auto it = book.begin();
+            for (std::size_t i = 0; i < count; ++i, ++it) {
+                result.push_back({it->first, it->second.PriceQuantity});
+            }
+            return result;
+        };
+        return {levels(bids_), levels(asks_)};
     }
 
     [[nodiscard]] std::optional<Price> lastTradePrice() const noexcept
@@ -462,7 +462,12 @@ std::optional<OrderSnapshot> Engine::order(OrderId orderId) const
 
 OrderBookSnapshot Engine::orderBook() const
 {
-    return impl_->orderBook();
+    return orderBook(std::numeric_limits<std::size_t>::max());
+}
+
+OrderBookSnapshot Engine::orderBook(std::size_t depth) const
+{
+    return impl_->orderBook(depth);
 }
 
 std::optional<Price> Engine::lastTradePrice() const noexcept

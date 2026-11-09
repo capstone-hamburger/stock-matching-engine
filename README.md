@@ -22,6 +22,8 @@ WebSocket 라우터는 별도 I/O 스레드에서 ERD `Order` JSON을 받고, �
 취소는 `type: "CANCEL_ORDER"`와 `stockId`, `orderId`, `userId`로 요청합니다.
 모든 요청·응답 JSON, `type`별 의미와 오류 코드는 노션에 가져올 수 있는
 [백엔드 JSON 통신 명세](docs/backend-json-api.md)에 정리되어 있습니다.
+백엔드는 `SUBSCRIBE_ORDER_BOOK`으로 구독해 기본 5초마다 매수·매도 5단계 호가를 받습니다.
+같은 연결에서 `UNSUBSCRIBE_ORDER_BOOK`을 보내면 `ORDER_BOOK_UNSUBSCRIBED` 확인 후 호가 수신이 멈추고 주문·조회는 계속할 수 있습니다. [구독·해제 JSON과 발행 흐름](docs/market-data-publisher.md)
 초기화부터 종료까지 함수별 호출 순서와 컨텍스트 이동은
 [`docs/websocket-router-flow.md`](docs/websocket-router-flow.md)에 설명되어 있습니다.
 
