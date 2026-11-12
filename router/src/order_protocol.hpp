@@ -21,13 +21,19 @@ struct CurrentPriceRequest {
     StockId stockId;
 };
 
+struct OrderBookSubscriptionRequest {
+    StockId stockId;
+    bool subscribe;
+};
+
 struct CancelOrderRequest {
     StockId stockId;
     OrderId orderId;
     UserId userId;
 };
 
-using IncomingRequest = std::variant<IncomingOrder, CurrentPriceRequest, CancelOrderRequest>;
+using IncomingRequest = std::variant<IncomingOrder, CurrentPriceRequest, CancelOrderRequest,
+    OrderBookSubscriptionRequest>;
 
 class PacketError final : public std::runtime_error {
 public:
@@ -36,6 +42,8 @@ public:
 };
 
 [[nodiscard]] IncomingRequest parseRequest(std::string_view payload);
+[[nodiscard]] std::string orderBookSubscriptionResult(StockId stockId, bool subscribed);
+[[nodiscard]] std::string orderBookSnapshot(StockId stockId, const OrderBookSnapshot& snapshot);
 [[nodiscard]] std::string currentPriceResult(StockId stockId, std::optional<Price> price);
 [[nodiscard]] std::string cancellationResult(
     const CancelOrderRequest& request, const CancellationResult& result);

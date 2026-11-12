@@ -12,7 +12,7 @@
 - 필드 순서는 자유지만, 각 요청에 명시된 필드는 모두 필요하며 추가 필드는 허용하지 않는다.
 - 현재 `payload`, `requestId`, 인증 토큰 필드는 없다. 임의로 추가하면 거절된다.
 - 같은 연결의 요청은 순서대로 처리·응답한다. 다른 연결 사이에는 엔진 작업 큐에 들어온 순서가 적용된다.
-- 결과는 요청한 연결로만 반환한다. 자동 구독이나 다른 연결로의 방송은 없다.
+- 주문·취소·조회 결과는 요청한 연결로 반환한다. 호가 스냅샷은 구독한 연결마다 기본 5초 주기로 푸시한다.
 - 기본 메시지 한도는 16 KiB, 연결 한도는 미완료 핸드셰이크를 포함해 128개다.
 
 ### 숫자 규칙
@@ -22,6 +22,7 @@
 | `stockId`, `orderId`, `userId` | 1 ~ 9,223,372,036,854,775,807 (양수 signed int64) |
 | 신규 주문의 `price`, `quantity` | 1 ~ 2,147,483,647 (양수 int32 범위) |
 | 결과의 수량·가격·체결 ID | JSON 정수; C++ 내부 표현은 int64 |
+| 체결의 `executedAt` | UTC epoch 밀리초를 나타내는 JSON 정수; C++ 내부 표현은 int64 |
 
 숫자를 문자열로 보내지 않는다. 소수, 지수 표기로 파싱되는 부동소수점, 불리언, null,
 int64 범위 초과 값은 ID·가격·수량으로 허용하지 않는다.
@@ -37,6 +38,8 @@ JavaScript에서는 큰 ID를 `Number`로 변환하면 정밀도가 손실될 �
 | `SELL` | 신규 지정가 매도: 지정가 이상의 매수 주문과 매칭 | `type`, `stockId`, `orderId`, `userId`, `status`, `price`, `quantity` | `Engine::submit()` |
 | `GET_CURRENT_PRICE` | 마지막 실제 체결 가격을 한 번 조회 | `type`, `stockId` | `Engine::lastTradePrice()` |
 | `CANCEL_ORDER` | 기존 주문의 미체결 잔량 전체 취소 | `type`, `stockId`, `orderId`, `userId` | `Engine::cancel()` |
+| `SUBSCRIBE_ORDER_BOOK` | 해당 연결에서 호가 스냅샷 구독 | `type`, `stockId` | 라우터에 구독 등록 |
+| `UNSUBSCRIBE_ORDER_BOOK` | 해당 연결의 호가 스냅샷 구독 해제 | `type`, `stockId` | 라우터에서 구독 해제 |
 
 현재 `type`은 통신 요청 종류를 나타낸다. `BUY`·`SELL`만 엔진의 주문 방향인
 `OrderType`으로 변환된다. `CANCEL_ORDER`·`GET_CURRENT_PRICE`는 새 매수·매도 주문이 아니다.
@@ -49,10 +52,15 @@ JavaScript에서는 큰 ID를 `Number`로 변환하면 정밀도가 손실될 �
 | `ORDER_RESULT` | 신규 BUY/SELL 주문의 엔진 처리 결과 | `accepted` 및 `rejectionReason` |
 | `CURRENT_PRICE` | 현재가 조회 결과 | `price`가 정수 또는 최초 체결 전 `null` |
 | `CANCEL_RESULT` | 취소 요청의 엔진 처리 결과 | `success` 및 `failureReason` |
+| `ORDER_BOOK_SUBSCRIBED` | 연결의 호가 구독 확인 | `stockId` |
+| `ORDER_BOOK_UNSUBSCRIBED` | 연결의 호가 구독 해제 확인 | `stockId` |
+| `ORDER_BOOK_SNAPSHOT` | 구독 연결에 보내는 주기적 호가 | `stockId`, `bids`, `asks` |
 | `ERROR` | JSON·필드·종목 오류 또는 내부 처리 예외 | `code`, `message` |
 
 `ORDER_RESULT`와 `CANCEL_RESULT`는 실패 결과도 담을 수 있다.
 `event`만 보고 주문 접수나 취소가 성공했다고 판단하지 않는다.
+
+호가 구독·해제 요청과 서버 이벤트의 JSON 형식은 [7. 호가창 구독](#7-호가창-구독)에서 확인할 수 있다.
 
 ## 4. 신규 매수·매도 주문
 
@@ -132,7 +140,8 @@ JavaScript에서는 큰 ID를 `Number`로 변환하면 정밀도가 손실될 �
       "buyOrderId": 1001,
       "sellOrderId": 2001,
       "price": 10100,
-      "quantity": 3
+      "quantity": 3,
+      "executedAt": 1793923200123
     }
   ]
 }
@@ -170,9 +179,12 @@ JavaScript에서는 큰 ID를 `Number`로 변환하면 정밀도가 손실될 �
 | `sellOrderId` | 체결된 매도 주문 ID |
 | `price` | 실제 체결 가격 |
 | `quantity` | 이 체결 한 건의 수량 |
+| `executedAt` | 실제 체결 시각. `1970-01-01T00:00:00Z`부터 경과한 UTC epoch 밀리초 정수 |
 
 한 주문이 여러 주문과 매칭되면 `trades`에 여러 객체가 들어간다.
-종목은 바깥 응답의 `stockId`를 사용한다. 현재 체결 시각(`executedAt`)은 포함하지 않는다.
+종목은 바깥 응답의 `stockId`를 사용한다. `executedAt`은 엔진이 각 체결을 생성할 때 서버의 시스템 시계로 기록한다.
+문자열이나 초 단위 값이 아닌 밀리초 정수이며, 예시의 `1793923200123`은 `2026-11-06T00:00:00.123Z`다.
+같은 밀리초에 발생한 체결은 같은 값을 가질 수 있으므로 체결 순서는 `trades` 배열 순서와 `tradeId`를 사용한다. 체결 시각 필드명은 `executedAt`이며 `tradeAt`은 반환하지 않는다.
 백엔드는 체결 목록을 이용해 매수·매도 양쪽 주문과 자산을 반영해야 한다.
 기존 대기 주문을 보낸 연결에 별도 체결 알림을 보내지는 않는다.
 
@@ -340,7 +352,83 @@ JavaScript에서는 큰 ID를 `Number`로 변환하면 정밀도가 손실될 �
 로그인 인증을 대신하지 않으며, 백엔드가 인증된 사용자의 ID를 넣어야 한다.
 원래 주문과 다른 WebSocket 연결에서도 올바른 소유자 ID로 취소할 수 있다.
 
-## 7. 공통 오류 응답
+## 7. 호가창 구독
+
+### 7.1 구독 요청과 확인 응답
+
+백엔드는 호가를 받을 WebSocket 연결에서 다음 요청을 한 번 보낸다.
+
+```json
+{
+  "type": "SUBSCRIBE_ORDER_BOOK",
+  "stockId": 1001
+}
+```
+
+서버가 구독을 등록하면 같은 연결로 확인 응답을 보낸다.
+
+```json
+{
+  "event": "ORDER_BOOK_SUBSCRIBED",
+  "stockId": 1001
+}
+```
+
+같은 연결에서 다시 구독해도 스냅샷은 주기마다 한 번만 전송된다.
+`depth` 같은 필드를 추가하거나 `stockId`를 생략하면 `ERROR`의 `code`는 `INVALID_REQUEST`다. 서버가 담당하지 않는 종목이면 `UNKNOWN_STOCK`이다.
+
+### 7.2 호가 스냅샷
+
+구독 확인 후 서버는 다음 발행 시점부터 기본 5초마다 스냅샷을 보낸다. 호가가 그대로여도 발행한다.
+
+```json
+{
+  "event": "ORDER_BOOK_SNAPSHOT",
+  "stockId": 1001,
+  "bids": [
+    {"price": 10000, "quantity": 8},
+    {"price": 9900, "quantity": 3}
+  ],
+  "asks": [
+    {"price": 10100, "quantity": 4},
+    {"price": 10200, "quantity": 6}
+  ]
+}
+```
+
+| 필드 | 의미 |
+| --- | --- |
+| `stockId` | 구독한 종목 ID |
+| `bids` | 매수 상위 5개 가격대까지 내림차순으로 정렬. 첫 항목이 최우선 매수호가 |
+| `asks` | 매도 상위 5개 가격대까지 오름차순으로 정렬. 첫 항목이 최우선 매도호가 |
+| `price` | 해당 가격대의 지정가를 나타내는 JSON 정수 |
+| `quantity` | 같은 방향·같은 가격에 대기 중인 모든 주문의 미체결 잔량 합계. int64 범위의 JSON 정수 |
+
+각 배열에는 대기 주문이 있는 가격대만 담긴다. 한쪽이 비면 해당 배열은 `[]`다.
+백엔드는 스냅샷을 받을 때마다 해당 종목의 매수·매도 호가를 두 배열로 통째로 교체한다.
+같은 연결에서 주문이나 조회 응답을 기다리는 동안에도 스냅샷이 도착할 수 있다. 이때는 호가창만 갱신하고 대기 중인 요청은 실제 응답이 올 때까지 유지한다.
+
+발행 주기 설정과 느린 연결에서의 전송 방식은 [호가 스냅샷과 Market Data Publisher](market-data-publisher.md)에 정리돼 있다.
+
+### 7.3 구독 해제
+
+구독한 WebSocket 연결에서 다음 요청을 보낸다.
+
+```json
+{"type":"UNSUBSCRIBE_ORDER_BOOK","stockId":1001}
+```
+
+서버는 해당 연결의 구독을 해제하고 확인 응답을 보낸다. 처음부터 구독하지 않았거나 이미 해제한 연결에서도 응답 형식은 같다.
+
+```json
+{"event":"ORDER_BOOK_UNSUBSCRIBED","stockId":1001}
+```
+
+이미 전송 중인 스냅샷은 해제 확인보다 먼저 도착할 수 있다. 확인을 받은 뒤에는 같은 연결에서 다시 `SUBSCRIBE_ORDER_BOOK`을 보낼 때까지 스냅샷 수신이 멈춘다. 주문·취소·조회는 계속 사용할 수 있고, 다른 연결은 각자의 구독 상태를 유지한다. 연결을 닫아도 해당 구독은 종료된다.
+
+해제 요청에는 `type`과 양수 int64 정수인 `stockId`만 허용한다. 필드 구성이나 `stockId` 형식·범위 오류는 `INVALID_REQUEST`, 서버가 담당하지 않는 종목은 `UNKNOWN_STOCK`이다. 거절된 요청은 구독 상태를 바꾸지 않는다.
+
+## 8. 공통 오류 응답
 
 등록되지 않은 종목 요청의 예시:
 
@@ -366,7 +454,7 @@ JavaScript에서는 큰 ID를 `Number`로 변환하면 정밀도가 손실될 �
 | --- | --- |
 | `INVALID_JSON` | JSON 구문 오류, 숫자 파싱 오류, 중첩 깊이 제한 초과 |
 | `INVALID_ORDER` | 신규 주문 필드·타입 오류 또는 지원하지 않는 요청 타입 |
-| `INVALID_REQUEST` | 조회·취소의 필드 누락·추가, ID 표현 오류, 0 이하 `stockId` |
+| `INVALID_REQUEST` | 조회·주문 취소·호가 구독 및 해제의 필드 누락·추가, ID 표현 오류, 0 이하 `stockId` |
 | `UNKNOWN_STOCK` | 유효한 양수 ID지만 서버가 담당하지 않는 종목 |
 | `TEXT_REQUIRED` | binary 메시지를 보냄; JSON text 필요 |
 | `INTERNAL_ERROR` | 엔진 처리 또는 응답 생성 중 예외 |
@@ -381,7 +469,7 @@ int64 정수이지만 0 이하이면 엔진이 `CANCEL_RESULT`의 실패 사유�
 형식 오류 후에도 연결을 재사용할 수 있다. 메시지 크기 초과는 JSON 오류 대신
 WebSocket close code `1009`로 연결을 닫고, 연결 한도 초과는 upgrade 이전에 TCP 연결을 닫는다.
 
-## 8. 백엔드 연동 시 동작 범위
+## 9. 백엔드 연동 시 동작 범위
 
 - 엔진은 잔고·보유수량 검증, 자산 예약, DB 저장·정산을 수행하지 않는다.
 - 취소 성공 응답은 엔진 메모리에 취소가 반영됐다는 뜻이며 DB 반영 완료를 뜻하지 않는다.
@@ -389,10 +477,10 @@ WebSocket close code `1009`로 연결을 닫고, 연결 한도 초과는 upgrade
 - 응답 유실이나 연결 종료만으로 주문·취소가 실패했다고 판단할 수 없다. 접수된 작업은 계속 처리될 수 있다.
 - 현재 주문 결과 재조회·이벤트 재전송·영속화·재시작 복구는 지원하지 않는다.
 - 엔진을 새로 시작하면 주문·호가창·현재가가 초기화되고 체결 ID도 다시 시작한다.
-- 실시간 알림 방송, 과거 체결·캔들 조회, 체결 시각 필드는 지원하지 않는다.
+- 개별 주문의 실시간 체결 알림 방송, 과거 체결·캔들 조회는 지원하지 않는다.
 - 백엔드와 같은 네트워크 환경에서 실행하면 localhost로 통신할 수 있다. 기본 서버에는 인증·TLS가 없다.
 
-## 9. 빠른 연동 테스트 순서
+## 10. 빠른 연동 테스트 순서
 
 서버를 새로 시작한 뒤 이 문서의 예시를 순서대로 보내면 된다.
 
@@ -403,6 +491,8 @@ WebSocket close code `1009`로 연결을 닫고, 연결 한도 초과는 upgrade
 5. `CANCEL_ORDER`: 주문 `2001`, 사용자 `20` → 성공, 취소 수량 4.
 6. 같은 취소 재전송 → `ALREADY_CANCELED`, 이번 취소 수량 0.
 7. `GET_CURRENT_PRICE`: 취소 후에도 `price: 10100` 유지.
+8. 같은 연결에서 `SUBSCRIBE_ORDER_BOOK`을 보낸 뒤 구독 확인과 양쪽 배열이 빈 스냅샷을 확인한다.
+9. `UNSUBSCRIBE_ORDER_BOOK`을 보내고 `ORDER_BOOK_UNSUBSCRIBED`를 받는다. 다음 발행 주기가 지난 뒤에도 같은 연결에서 현재가를 조회하면 `CURRENT_PRICE`만 받는다.
 
 자동 검증은 `ctest --preset dev`로 실행한다. 실제 WebSocket 통합 테스트에서
 매수·매도 취소, 부분 체결 후 취소, 소유자·상태 오류, 입력 검증, 요청 순서,

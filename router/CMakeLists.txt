@@ -1,4 +1,4 @@
-add_library(matching_router STATIC src/router.cpp src/order_protocol.cpp)
+add_library(matching_router STATIC src/router.cpp src/order_protocol.cpp src/market_data_publisher.cpp)
 add_library(matching_engine::router ALIAS matching_router)
 target_include_directories(matching_router PUBLIC include)
 target_link_libraries(matching_router

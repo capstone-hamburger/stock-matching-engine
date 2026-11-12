@@ -2,6 +2,7 @@
 
 #include "matching_engine/models.hpp"
 
+#include <cstddef>
 #include <memory>
 #include <optional>
 
@@ -23,6 +24,7 @@ public:
     [[nodiscard]] CancellationResult cancel(OrderId orderId, UserId requestingUserId);
     [[nodiscard]] std::optional<OrderSnapshot> order(OrderId orderId) const;
     [[nodiscard]] OrderBookSnapshot orderBook() const;
+    [[nodiscard]] OrderBookSnapshot orderBook(std::size_t depth) const;
     [[nodiscard]] std::optional<Price> lastTradePrice() const noexcept;
 
 private:

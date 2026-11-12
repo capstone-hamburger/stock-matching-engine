@@ -18,7 +18,7 @@ cmake --build --preset dev
 - 라이브러리: Boost.Beast/Asio, nlohmann/json
 - 요청 한도: WebSocket 메시지 하나당 16 KiB
 - 연결 한도: 미완료 핸드셰이크를 포함해 128개
-- 메시지 유형: UTF-8 JSON text, 메시지 하나에 주문·취소·조회 요청 중 하나
+- 메시지 유형: UTF-8 JSON text, 메시지 하나에 주문·취소·조회·호가 구독·구독 해제 요청 중 하나
 
 `matching_engine_server [address [port [stockId]]]`로 기본값을 바꿀 수 있습니다.
 다른 호스트의 백엔드에서 접속하려면 적절한 인터페이스 주소나 `0.0.0.0`으로
@@ -54,6 +54,8 @@ I/O 스레드는 accept, WebSocket handshake, read/write, JSON 파싱·검증과
 같은 연결의 주문은 전송 순서를 유지합니다. 서로 다른 연결 사이에서는 단일 I/O
 스레드가 검증을 마치고 작업 큐에 넣은 순서가 엔진 접수 순서입니다. 클라이언트 시각이나
 여러 연결의 실제 네트워크 도착 시각을 기준으로 전역 순서를 보장하지 않습니다.
+
+`SUBSCRIBE_ORDER_BOOK`과 `UNSUBSCRIBE_ORDER_BOOK`은 I/O 스레드에서 해당 연결의 구독 상태를 설정합니다. 구독 중에는 기본 5초마다 스냅샷을 전송합니다. 해제 확인인 `ORDER_BOOK_UNSUBSCRIBED` 이후에는 재구독할 때까지 해당 연결로의 발행을 중단합니다. [Market Data Publisher 연동](market-data-publisher.md)
 
 ## 주문 요청
 
@@ -158,11 +160,16 @@ JavaScript 백엔드는 큰 bigint ID를 `Number`로 변환하면 정밀도를 �
       "buyOrderId": 1001,
       "sellOrderId": 2001,
       "price": 10100,
-      "quantity": 3
+      "quantity": 3,
+      "executedAt": 1793923200123
     }
   ]
 }
 ```
+
+`trades`의 각 객체는 체결 시각 `executedAt`을 JSON 정수로 포함합니다.
+엔진이 체결할 때 서버 시스템 시계로 기록하며, `1970-01-01T00:00:00Z`부터 경과한 UTC epoch 밀리초입니다.
+예시의 `1793923200123`은 `2026-11-06T00:00:00.123Z`를 뜻하며, `tradeAt` 필드는 반환하지 않습니다.
 
 | 엔진 결과 | `accepted` | ERD `status` | `engineStatus` |
 | --- | --- | --- | --- |
@@ -192,7 +199,7 @@ ERD에는 거절 상태가 없으므로 거절은 `status=null`과 `rejectionRea
 
 - `INVALID_JSON`: JSON 구문 오류 또는 과도한 중첩(깊이 8 초과)
 - `INVALID_ORDER`: 잘못된 필드 구성, 타입, enum, 정수 표현
-- `INVALID_REQUEST`: 조회·취소의 필드 구성, ID 정수 표현 또는 stockId 범위 오류
+- `INVALID_REQUEST`: 조회·주문 취소·호가 구독 및 해제의 필드 구성, ID 정수 표현 또는 stockId 범위 오류
 - `UNKNOWN_STOCK`: 등록되지 않은 종목
 - `TEXT_REQUIRED`: binary 메시지
 - `INTERNAL_ERROR`: 엔진 처리 또는 결과 생성 중 예외; 주문 반영 여부가 불확실할 수 있음
@@ -217,8 +224,8 @@ HTTP upgrade 이전에 TCP 연결을 닫습니다. 일반 close/ping/pong/fragme
 
 ## 범위와 검증
 
-현재는 단일 종목 BUY/SELL 접수, 주문 취소와 현재가 조회용 내부 연동 MVP입니다. TLS, 인증, 잔고·보유수량 검증,
-DB 저장·정산, 기타 조회 WebSocket API, 다종목 라우팅과 알림 방송은 구현하지 않았습니다.
+현재는 단일 종목 BUY/SELL 접수, 주문 취소, 현재가 조회와 호가 구독·해제를 지원합니다. TLS, 인증, 잔고·보유수량 검증,
+DB 저장·정산, 기타 조회 WebSocket API, 다종목 라우팅과 개별 체결 알림 방송은 구현하지 않았습니다.
 기본 바인딩은 로컬 주소이며 공개 인터넷 서비스로 배포하는 설정이 아닙니다.
 
 `ctest --preset dev`는 기존 엔진 단위 테스트와 실제 loopback WebSocket 통합 테스트를

@@ -1,6 +1,7 @@
 #include "matching_engine/engine.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -25,9 +26,6 @@ struct OrderRecord {
     Quantity remainingQuantity;
     OrderStatus status{OrderStatus::Open};
 };
-
-using BidBook = std::map<Price, std::deque<OrderId>, std::greater<Price>>;
-using AskBook = std::map<Price, std::deque<OrderId>, std::less<Price>>;
 
 [[nodiscard]] bool isValidOrderType(OrderType type) noexcept
 {
@@ -64,6 +62,14 @@ using AskBook = std::map<Price, std::deque<OrderId>, std::less<Price>>;
 } // namespace
 
 class Engine::Impl final {
+    struct PriceLevel {
+        std::deque<OrderId> queue;
+        Quantity PriceQuantity{0};
+    };
+
+    using BidBook = std::map<Price, PriceLevel, std::greater<Price>>;
+    using AskBook = std::map<Price, PriceLevel, std::less<Price>>;
+
 public:
     explicit Impl(StockId stockId)
         : stockId_(stockId)
@@ -178,19 +184,19 @@ public:
         return snapshot(iterator->second);
     }
 
-    [[nodiscard]] OrderBookSnapshot orderBook() const
+    [[nodiscard]] OrderBookSnapshot orderBook(std::size_t depth) const
     {
-        OrderBookSnapshot result;
-        result.bids.reserve(bids_.size());
-        result.asks.reserve(asks_.size());
-
-        for (const auto& [price, queue] : bids_) {
-            result.bids.push_back({price, levelQuantity(queue)});
-        }
-        for (const auto& [price, queue] : asks_) {
-            result.asks.push_back({price, levelQuantity(queue)});
-        }
-        return result;
+        const auto levels = [depth](const auto& book) {
+            std::vector<matching_engine::PriceLevel> result;
+            const auto count = std::min(depth, book.size());
+            result.reserve(count);
+            auto it = book.begin();
+            for (std::size_t i = 0; i < count; ++i, ++it) {
+                result.push_back({it->first, it->second.PriceQuantity});
+            }
+            return result;
+        };
+        return {levels(bids_), levels(asks_)};
     }
 
     [[nodiscard]] std::optional<Price> lastTradePrice() const noexcept
@@ -244,18 +250,18 @@ private:
         };
 
         if (request.type == OrderType::Buy) {
-            for (const auto& [price, queue] : asks_) {
+            for (const auto& [price, level] : asks_) {
                 if (price > request.price || result.remainingQuantity == 0) {
                     break;
                 }
-                visitQueue(queue);
+                visitQueue(level.queue);
             }
         } else {
-            for (const auto& [price, queue] : bids_) {
+            for (const auto& [price, level] : bids_) {
                 if (price < request.price || result.remainingQuantity == 0) {
                     break;
                 }
-                visitQueue(queue);
+                visitQueue(level.queue);
             }
         }
         return result;
@@ -289,25 +295,16 @@ private:
         if (type == OrderType::Buy) {
             const auto iterator = bids_.find(price);
             if (iterator != bids_.end()) {
-                current = levelQuantity(iterator->second);
+                current = iterator->second.PriceQuantity;
             }
         } else {
             const auto iterator = asks_.find(price);
             if (iterator != asks_.end()) {
-                current = levelQuantity(iterator->second);
+                current = iterator->second.PriceQuantity;
             }
         }
 
         return current <= std::numeric_limits<Quantity>::max() - quantity;
-    }
-
-    [[nodiscard]] Quantity levelQuantity(const std::deque<OrderId>& queue) const
-    {
-        Quantity total = 0;
-        for (const OrderId orderId : queue) {
-            total += orders_.at(orderId).remainingQuantity;
-        }
-        return total;
     }
 
     void matchBuy(OrderRecord& incoming, std::vector<Trade>& trades)
@@ -318,10 +315,10 @@ private:
                 break;
             }
 
-            auto& queue = level->second;
+            auto& queue = level->second.queue;
             while (incoming.remainingQuantity > 0 && !queue.empty()) {
                 OrderRecord& resting = orders_.at(queue.front());
-                executeTrade(incoming, resting, trades);
+                executeTrade(incoming, resting, level->second, trades);
                 if (resting.remainingQuantity == 0) {
                     queue.pop_front();
                 }
@@ -341,10 +338,10 @@ private:
                 break;
             }
 
-            auto& queue = level->second;
+            auto& queue = level->second.queue;
             while (incoming.remainingQuantity > 0 && !queue.empty()) {
                 OrderRecord& resting = orders_.at(queue.front());
-                executeTrade(incoming, resting, trades);
+                executeTrade(incoming, resting, level->second, trades);
                 if (resting.remainingQuantity == 0) {
                     queue.pop_front();
                 }
@@ -356,7 +353,11 @@ private:
         }
     }
 
-    void executeTrade(OrderRecord& incoming, OrderRecord& resting, std::vector<Trade>& trades)
+    void executeTrade(
+        OrderRecord& incoming,
+        OrderRecord& resting,
+        PriceLevel& restingLevel,
+        std::vector<Trade>& trades)
     {
         const Quantity tradedQuantity = std::min(
             incoming.remainingQuantity,
@@ -369,6 +370,8 @@ private:
             .sellOrderId = incoming.type == OrderType::Sell ? incoming.orderId : resting.orderId,
             .price = resting.price,
             .quantity = tradedQuantity,
+            .executedAt = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count(),
         });
 
         if (tradeId == std::numeric_limits<TradeId>::max()) {
@@ -381,6 +384,7 @@ private:
         incoming.remainingQuantity -= tradedQuantity;
         resting.filledQuantity += tradedQuantity;
         resting.remainingQuantity -= tradedQuantity;
+        restingLevel.PriceQuantity -= tradedQuantity;
         resting.status = resting.remainingQuantity == 0 ? OrderStatus::Filled
                                                         : OrderStatus::PartiallyFilled;
         lastTradePrice_ = resting.price;
@@ -388,11 +392,9 @@ private:
 
     void addToBook(const OrderRecord& order)
     {
-        if (order.type == OrderType::Buy) {
-            bids_[order.price].push_back(order.orderId);
-        } else {
-            asks_[order.price].push_back(order.orderId);
-        }
+        auto& level = order.type == OrderType::Buy ? bids_[order.price] : asks_[order.price];
+        level.queue.push_back(order.orderId);
+        level.PriceQuantity += order.remainingQuantity;
     }
 
     void removeFromBook(const OrderRecord& order)
@@ -403,10 +405,11 @@ private:
                 return;
             }
 
-            auto& queue = level->second;
+            auto& queue = level->second.queue;
             const auto position = std::find(queue.begin(), queue.end(), order.orderId);
             if (position != queue.end()) {
                 queue.erase(position);
+                level->second.PriceQuantity -= order.remainingQuantity;
             }
             if (queue.empty()) {
                 book.erase(level);
@@ -459,7 +462,12 @@ std::optional<OrderSnapshot> Engine::order(OrderId orderId) const
 
 OrderBookSnapshot Engine::orderBook() const
 {
-    return impl_->orderBook();
+    return orderBook(std::numeric_limits<std::size_t>::max());
+}
+
+OrderBookSnapshot Engine::orderBook(std::size_t depth) const
+{
+    return impl_->orderBook(depth);
 }
 
 std::optional<Price> Engine::lastTradePrice() const noexcept

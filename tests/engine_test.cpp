@@ -1,5 +1,6 @@
 #include "matching_engine/engine.hpp"
 
+#include <chrono>
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
@@ -117,12 +118,20 @@ void testBuyPriceTimePriorityAndContinuousMatching(TestContext& test)
     test.expect(!engine.lastTradePrice().has_value(),
         "resting orders must not set a last trade price");
 
+    const auto beforeExecution = std::chrono::floor<std::chrono::milliseconds>(
+        std::chrono::system_clock::now()).time_since_epoch().count();
     const auto result = engine.submit(request(20, 5, OrderType::Buy, 102, 8));
+    const auto afterExecution = std::chrono::floor<std::chrono::milliseconds>(
+        std::chrono::system_clock::now()).time_since_epoch().count();
     test.expect(result.accepted && result.status == OrderStatus::Filled,
         "crossing buy must fill completely");
     test.expect(result.filledQuantity == 8 && result.remainingQuantity == 0,
         "buy fill quantities must match");
     test.expect(result.trades.size() == 3, "buy must match three resting orders");
+    for (const auto& trade : result.trades) {
+        test.expect(trade.executedAt >= beforeExecution && trade.executedAt <= afterExecution,
+            "each trade must record execution time in UTC epoch milliseconds");
+    }
 
     if (result.trades.size() == 3) {
         test.expect(result.trades[0].tradeId == 1
@@ -256,6 +265,72 @@ void testCancellationAndLastPrice(TestContext& test)
         "non-trading submit and cancel must leave last price empty");
 }
 
+void testPriceLevelQuantityLifecycle(TestContext& test)
+{
+    for (const auto side : {OrderType::Buy, OrderType::Sell}) {
+        Engine engine{505};
+        const auto opposite = side == OrderType::Buy ? OrderType::Sell : OrderType::Buy;
+        const auto expectQuantity = [&test, &engine](
+                                        OrderType type,
+                                        matching_engine::Quantity expected) {
+            const auto book = engine.orderBook();
+            const auto& levels = type == OrderType::Buy ? book.bids : book.asks;
+            if (expected == 0) {
+                test.expect(levels.empty(), "exhausted price level must be removed");
+            } else {
+                test.expect(levels.size() == 1
+                        && levels[0].price == 100
+                        && levels[0].quantity == expected,
+                    "price level quantity must equal the remaining resting shares");
+            }
+        };
+
+        test.expect(engine.submit(request(1, 10, side, 100, 5)).accepted,
+            "first order must create a price level");
+        expectQuantity(side, 5);
+        test.expect(engine.submit(request(2, 20, side, 100, 7)).accepted,
+            "second order must join the price level");
+        test.expect(engine.submit(request(3, 30, side, 100, 9)).accepted,
+            "third order must join the price level");
+        expectQuantity(side, 21);
+
+        test.expect(engine.cancel(2, 20).canceledQuantity == 7,
+            "canceling a middle order must remove its full remainder");
+        expectQuantity(side, 14);
+        test.expect(engine.cancel(1, 99).failureReason == CancellationFailureReason::NotOwner,
+            "unauthorized cancel must fail");
+        test.expect(!engine.submit(request(3, 30, side, 100, 9)).accepted,
+            "duplicate submission must fail");
+        expectQuantity(side, 14);
+
+        const auto partial = engine.submit(request(4, 40, opposite, 100, 3));
+        test.expect(partial.filledQuantity == 3, "partial resting fill must trade three shares");
+        const auto firstOrder = engine.order(1);
+        test.expect(firstOrder.has_value() && firstOrder->remainingQuantity == 2,
+            "FIFO priority must survive cancellation of a middle order");
+        expectQuantity(side, 11);
+        test.expect(engine.cancel(1, 10).canceledQuantity == 2,
+            "canceling a partially filled order must subtract only its remainder");
+        expectQuantity(side, 9);
+
+        const auto crossing = engine.submit(request(5, 50, opposite, 100, 12));
+        test.expect(crossing.filledQuantity == 9 && crossing.remainingQuantity == 3,
+            "crossing order must rest only its unmatched remainder");
+        expectQuantity(side, 0);
+        expectQuantity(opposite, 3);
+        test.expect(engine.cancel(5, 50).canceledQuantity == 3,
+            "last order cancellation must remove the price level");
+        expectQuantity(opposite, 0);
+
+        test.expect(engine.submit(request(6, 60, side, 100, matching_engine::maxOrderQuantity)).accepted,
+            "previously exhausted price level must be reusable");
+        expectQuantity(side, matching_engine::maxOrderQuantity);
+        test.expect(engine.submit(request(7, 70, side, 100, matching_engine::maxOrderQuantity)).accepted,
+            "price level must support aggregate quantities beyond one order's limit");
+        expectQuantity(side, matching_engine::maxOrderQuantity * 2);
+    }
+}
+
 } // namespace
 
 int main()
@@ -265,6 +340,7 @@ int main()
     testBuyPriceTimePriorityAndContinuousMatching(test);
     testSellMatchesHighestBidAtRestingPrices(test);
     testCancellationAndLastPrice(test);
+    testPriceLevelQuantityLifecycle(test);
 
     if (test.failureCount() != 0) {
         std::cerr << test.failureCount() << " test assertion(s) failed\n";

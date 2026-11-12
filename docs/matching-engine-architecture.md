@@ -6,7 +6,8 @@
 
 엔진 코어 내부에는 외부 요청 작업 큐가 없다. 새 WebSocket `Router`는 코어 바깥에서
 별도 I/O 스레드와 엔진 Worker 스레드를 실행하고, Asio 작업 큐를 통해 주문을 전달한다.
-호가 가격별 `std::deque<OrderId>`는 여전히 가격-시간 우선순위를 위한 주문 저장 구조다.
+호가 스냅샷 발행 타이머는 엔진 Worker에서 실행한다. I/O 스레드는 연결별 구독·해제를 처리하며 구독 중인 연결에만 스냅샷을 보낸다.
+호가 가격별 `Engine::Impl::PriceLevel`은 가격-시간 우선순위를 위한 `std::deque<OrderId>`와 해당 가격의 대기 잔량 합계인 `PriceQuantity`를 보관한다.
 네트워크 실행 계층은 [WebSocket 라우터 문서](websocket-router.md)를 참고한다.
 
 | 구분 | 현재 상태 |
@@ -85,6 +86,12 @@ struct OrderRequest {
 | `price` | 지정가 | 1 이상 `INT32_MAX` 이하 |
 | `quantity` | 주문수량 | 1 이상 `INT32_MAX` 이하 |
 
+### `Trade`
+
+체결 결과는 `tradeId`, `buyOrderId`, `sellOrderId`, `price`, `quantity`, `executedAt`을 포함한다.
+`executedAt`은 `std::int64_t`이며 `executeTrade()`에서 체결 생성 시 시스템 시계를 읽어 기록한다.
+기준은 `1970-01-01T00:00:00Z`이고 단위는 밀리초다. 라우터는 저장된 값을 JSON 정수로 그대로 직렬화한다.
+
 ## 4. 공개 함수
 
 | 함수 | 필요한 인자 | 반환값 | 기능 |
@@ -123,7 +130,7 @@ struct OrderRequest {
 
 ### `orderBook()`
 
-매수호가는 높은 가격부터, 매도호가는 낮은 가격부터 반환한다. 각 가격의 주문 ID를 순회해 현재 미체결 잔량을 합산한다.
+매수호가는 높은 가격부터, 매도호가는 낮은 가격부터 반환한다. 각 가격 레벨에 유지되는 `PriceQuantity`를 조회용 `quantity`로 복사하므로 주문별 잔량을 다시 합산하지 않는다.
 
 ### `lastTradePrice()`
 
@@ -144,12 +151,11 @@ struct OrderRequest {
 | `previewMatch(request)` | 주문 요청 | `MatchPreview` | 상태 변경 없이 예상 체결 건수와 잔량 계산 |
 | `hasTradeIdCapacity(count)` | 예상 체결 건수 | `bool` | 체결 ID 발급 여유 검사 |
 | `hasBookQuantityCapacity(...)` | 종류, 가격, 잔량 | `bool` | 가격 레벨 수량 합계 오버플로 검사 |
-| `levelQuantity(queue)` | 가격 레벨 주문 ID 큐 | `Quantity` | 해당 가격의 현재 잔량 합산 |
 | `matchBuy(incoming, trades)` | 신규 주문, 체결 목록 | 없음 | 최저 매도호가부터 매수 주문 매칭 |
 | `matchSell(incoming, trades)` | 신규 주문, 체결 목록 | 없음 | 최고 매수호가부터 매도 주문 매칭 |
-| `executeTrade(...)` | 신규 주문, 대기 주문, 체결 목록 | 없음 | 한 건의 체결 생성 및 양쪽 주문 갱신 |
-| `addToBook(order)` | 잔량이 있는 주문 | 없음 | 주문을 해당 가격 FIFO 뒤에 추가 |
-| `removeFromBook(order)` | 취소할 주문 | 없음 | 가격 레벨에서 주문 ID 제거 |
+| `executeTrade(...)` | 신규 주문, 대기 주문, 대기 가격 레벨, 체결 목록 | 없음 | 체결 생성, 양쪽 주문 갱신, 대기 레벨의 `PriceQuantity` 차감 |
+| `addToBook(order)` | 잔량이 있는 주문 | 없음 | 주문을 해당 가격 FIFO 뒤에 추가하고 `PriceQuantity`에 잔량 가산 |
+| `removeFromBook(order)` | 취소할 주문 | 없음 | 주문 ID 제거 및 `PriceQuantity`에서 취소 잔량 차감 |
 
 `models.cpp`의 `toString()` 오버로드들은 주문 종류, 주문 상태, 주문 거절 사유와 취소 실패 사유를 로그나 API 응답에 사용할 문자열로 변환한다.
 
@@ -215,11 +221,12 @@ sequenceDiagram
 
     loop 잔량이 있고 가격이 교차하는 동안
         Match->>Book: 최우선 가격 레벨 조회
-        Book-->>Match: FIFO 주문 ID 큐
+        Book-->>Match: PriceLevel (FIFO 주문 ID 큐, PriceQuantity)
         Match->>Orders: queue.front() 주문 조회
         Orders-->>Match: 기존 대기 주문
-        Match->>Trade: executeTrade(incoming, resting, trades)
+        Match->>Trade: executeTrade(incoming, resting, restingLevel, trades)
         Trade->>Orders: 양쪽 체결량과 잔량 갱신
+        Trade->>Book: 대기 레벨의 PriceQuantity에서 체결 수량 차감
         Trade->>Trade: 체결 ID와 최근 체결가 갱신
 
         alt 기존 주문 전량 체결
@@ -256,6 +263,7 @@ sequenceDiagram
         Impl-->>Caller: AlreadyFilled / AlreadyCanceled
     else 취소 가능
         Impl->>Book: removeFromBook(order)
+        Note over Impl,Book: 주문 ID 제거 및 PriceQuantity에서 취소 잔량 차감
         Impl->>Orders: 취소량, 잔량, 상태 갱신
         Impl-->>Engine: CancellationResult
         Engine-->>Caller: 취소 결과
@@ -282,8 +290,8 @@ sequenceDiagram
         Caller->>Engine: orderBook()
         Engine->>Impl: orderBook()
         loop 각 가격 레벨
-            Impl->>Impl: levelQuantity(queue)
-            Impl->>Orders: 각 주문 잔량 조회
+            Impl->>Book: PriceQuantity 조회
+            Book-->>Impl: 해당 가격의 대기 잔량 합계
         end
         Impl-->>Caller: OrderBookSnapshot
     else 최근 체결가 조회
@@ -306,20 +314,30 @@ std::unordered_map<OrderId, OrderRecord> orders_;
 ### 가격별 호가창: 정렬된 `std::map`
 
 ```cpp
+struct PriceLevel {
+    std::deque<OrderId> queue;
+    Quantity PriceQuantity{0};
+};
+
 using BidBook =
-    std::map<Price, std::deque<OrderId>, std::greater<Price>>;
+    std::map<Price, PriceLevel, std::greater<Price>>;
 
 using AskBook =
-    std::map<Price, std::deque<OrderId>, std::less<Price>>;
+    std::map<Price, PriceLevel, std::less<Price>>;
 ```
+
+위 구조와 별칭은 `Engine::Impl` 내부에 정의한다. 공개 조회 모델인 `matching_engine::PriceLevel { price, quantity }`와는 별개의 타입이다.
 
 - `BidBook`은 높은 가격부터 정렬되므로 `begin()`이 최고 매수호가다.
 - `AskBook`은 낮은 가격부터 정렬되므로 `begin()`이 최저 매도호가다.
 - 가격 레벨 탐색과 삽입 비용은 `O(log P)`이며 `P`는 가격 레벨 수다.
+- `PriceQuantity`는 0으로 초기화되며, 해당 레벨의 모든 대기 주문 잔량 합계와 일치한다.
+- 신규 주문의 매칭이 끝나고 잔량을 큐에 넣을 때 그 잔량을 가산한다. 체결마다 기존 대기 주문의 레벨에서 체결 수량을 차감하고, 취소 시에는 취소 주문의 남은 수량만 차감한다.
+- 큐가 비면 가격 레벨을 제거한다. 호가 조회와 수량 오버플로 검사는 저장된 `PriceQuantity`를 사용한다.
 
 ### 가격 내 우선순위: `std::deque<OrderId>`
 
-각 가격 레벨에서 주문 ID를 접수 순서대로 저장한다.
+각 가격 레벨의 `queue`에 주문 ID를 접수 순서대로 저장한다.
 
 ```text
 가격 10,000
@@ -357,9 +375,9 @@ front                                         back
 | 최우선 주문 확인 | `O(1)` | `map::begin()`, `deque::front()` |
 | 주문 취소 | `O(log P + Q)` | 해당 가격 큐에서 주문 ID 선형 검색 |
 | 주문 상태 조회 | 평균 `O(1)` | 주문 ID 조회 |
-| 전체 호가 스냅샷 | `O(A)` | 모든 활성 주문 잔량을 합산 |
+| 전체 호가 스냅샷 | `O(P)` | 각 가격 레벨의 `PriceQuantity`를 복사 |
 
-`P`는 가격 레벨 수, `Q`는 한 가격에 대기 중인 주문 수, `A`는 전체 활성 주문 수다.
+`P`는 가격 레벨 수, `Q`는 한 가격에 대기 중인 주문 수다.
 
 ## 12. 비동기·멀티스레드 확장 가능성
 

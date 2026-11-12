@@ -2,6 +2,7 @@
 
 #include "matching_engine/models.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -15,6 +16,7 @@ struct RouterConfig {
     StockId stockId{1001};
     std::size_t maxMessageBytes{16 * 1024};
     std::size_t maxConnections{128};
+    std::chrono::milliseconds marketDataInterval{std::chrono::seconds{5}};
 };
 
 // Owns one WebSocket I/O thread and one engine worker thread.
